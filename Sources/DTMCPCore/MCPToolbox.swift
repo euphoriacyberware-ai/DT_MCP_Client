@@ -93,6 +93,35 @@ public struct MCPToolbox: Sendable {
             ]),
             annotations: .init(title: "Generate image", readOnlyHint: false, openWorldHint: false)),
         Tool(
+            name: "generate_video",
+            description: """
+                Start a video job with a video model (Wan, LTX, Hunyuan, ...; find one with list_models). \
+                Returns a job_id; video takes minutes, so use wait_for_job with a long timeout. \
+                outputs is [video.mp4, first_frame.png]. Give init_image to start from a picture \
+                (image-to-video). Use get_model_recommendations for the model's size and settings. \
+                Same folder rules as generate_image.
+                """,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "prompt": prop("string", "What happens in the video."),
+                    "negative_prompt": prop("string", "What to avoid."),
+                    "model": prop("string", "Video model file name from list_models."),
+                    "num_frames": prop("integer", "Number of frames; clip length is num_frames divided by the model's fps. Counts like 33, 49 or 81 are typical."),
+                    "width": prop("integer", "Pixels, multiple of 64."),
+                    "height": prop("integer", "Pixels, multiple of 64."),
+                    "steps": prop("integer", "Sampling steps."),
+                    "guidance_scale": prop("number", "CFG scale; model-specific."),
+                    "shift": prop("number", "Sampling shift; model-specific."),
+                    "sampler": prop("string", "Sampler id."),
+                    "seed": prop("integer", "Omit for random."),
+                    "init_image": prop("string", "Absolute path of a start frame for image-to-video."),
+                    "strength": prop("number", "0-1 for init_image; default 1.0."),
+                ]),
+                "required": .array([.string("prompt"), .string("model"), .string("num_frames")]),
+            ]),
+            annotations: .init(title: "Generate video", readOnlyHint: false, openWorldHint: false)),
+        Tool(
             name: "get_job",
             description: "Get the status, progress and output file paths of a job.",
             inputSchema: .object([
@@ -159,6 +188,13 @@ public struct MCPToolbox: Sendable {
                 return json(ModelPresets.recommend(model: model, catalog: catalog, defaults: await manager.defaults))
             case "generate_image":
                 return json(try await generateImage(args ?? [:]))
+            case "generate_video":
+                var a = args ?? [:]
+                guard a["model"]?.stringValue?.isEmpty == false else { throw ToolError("'model' is required for video.") }
+                guard let n = a["num_frames"]?.intValue, n >= 2 else { throw ToolError("'num_frames' is required and must be at least 2.") }
+                a["batch_count"] = nil
+                a.removeValue(forKey: "mask_image")
+                return json(try await generateImage(a, numFrames: n))
             case "get_job":
                 let id = try requireString(args, "job_id")
                 guard let job = await manager.jobs.get(id) else { throw ToolError("Unknown job_id '\(id)'.") }
@@ -184,7 +220,7 @@ public struct MCPToolbox: Sendable {
         }
     }
 
-    private func generateImage(_ a: [String: Value]) async throws -> Job {
+    private func generateImage(_ a: [String: Value], numFrames: Int? = nil) async throws -> Job {
         let d = await manager.defaults
         guard let prompt = a["prompt"]?.stringValue, !prompt.isEmpty else {
             throw ToolError("'prompt' is required.")
@@ -198,6 +234,7 @@ public struct MCPToolbox: Sendable {
             guidanceScale: a["guidance_scale"]?.doubleValue ?? d.guidanceScale,
             shift: a["shift"]?.doubleValue ?? d.shift,
             sampler: a["sampler"]?.stringValue ?? d.sampler)
+        p.numFrames = numFrames
         p.negativePrompt = a["negative_prompt"]?.stringValue ?? ""
         p.batchCount = max(a["batch_count"]?.intValue ?? 1, 1)
         if let s = a["seed"]?.intValue {

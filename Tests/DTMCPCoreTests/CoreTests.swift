@@ -213,3 +213,48 @@ import CoreGraphics
         await #expect(throws: FolderAccess.AccessError.self) { _ = try await folders.authorizedReadURL(f.path) }
     }
 }
+
+// MARK: - Video
+
+import AVFoundation
+
+@Suite struct VideoTests {
+    @Test func imageModelsAreRecognised() {
+        #expect(VideoOutput.isKnownImageModel("z_image_turbo_1.0_q8p.ckpt", version: "z_image"))
+        #expect(VideoOutput.isKnownImageModel("sd_v1.5_f16.ckpt", version: "v1"))
+        #expect(!VideoOutput.isKnownImageModel("wan_v2.2_a14b_hne_t2v_q8p.ckpt", version: nil))
+        #expect(!VideoOutput.isKnownImageModel("brand_new_model.ckpt", version: nil))  // unknown passes through
+    }
+
+    @Test func assemblesMP4AndPoster() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dtmcp-vid-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let frames = (0..<12).map { i in
+            ImageInputTests.image(128, 128, left: (UInt8(i * 20), 40, 80, 255), right: (200, UInt8(i * 10), 0, 255))
+        }
+        let out = try await VideoOutput.write(frames: frames, frameRate: 16, audio: nil, jobID: "job_test", into: dir)
+        #expect(out.video.hasSuffix(".mp4") && out.poster.hasSuffix(".png"))
+        #expect(FileManager.default.fileExists(atPath: out.poster))
+
+        let asset = AVURLAsset(url: URL(fileURLWithPath: out.video))
+        let duration = try await asset.load(.duration).seconds
+        #expect(abs(duration - 12.0 / 16.0) < 0.2)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        #expect(tracks.count == 1)
+    }
+
+    @Test func singleFrameIsNotAVideo() async {
+        let dir = FileManager.default.temporaryDirectory
+        let one = [ImageInputTests.image(64, 64, left: (0, 0, 0, 255), right: (0, 0, 0, 255))]
+        await #expect(throws: VideoOutputError.self) {
+            _ = try await VideoOutput.write(frames: one, frameRate: 16, audio: nil, jobID: "x", into: dir)
+        }
+    }
+
+    @Test func videoToolRegistered() {
+        let t = MCPToolbox.tools.first { $0.name == "generate_video" }
+        #expect(t != nil)
+    }
+}

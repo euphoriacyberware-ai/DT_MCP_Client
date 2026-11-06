@@ -25,14 +25,18 @@ public struct ImageJobParams: Sendable {
     public var strength: Double?
     /// When true, width/height are derived from the init image instead of the values above.
     public var sizeFromImage = false
+    /// Set for video jobs: number of frames to generate. Requires a video model.
+    public var numFrames: Int?
 }
 
 public enum GenerationError: Error, LocalizedError {
+    case invalid(String)
     case notConfigured
     case unknownSampler(String)
 
     public var errorDescription: String? {
         switch self {
+        case .invalid(let m): return m
         case .notConfigured: return "Not connected to a Draw Things server. Ask the user to configure the connection in the DT MCP Client app."
         case .unknownSampler(let s): return "Unknown sampler '\(s)'. Valid samplers: \(SamplerNames.all.joined(separator: ", "))"
         }
@@ -150,9 +154,22 @@ public actor GenerationManager {
                 maskedFraction = ImageInputs.regeneratedFraction(maskCG!)
             }
         }
-        let strength = params.strength ?? (maskCG != nil ? 1.0 : 0.7)
+        let isVideo = params.numFrames != nil
+        if isVideo {
+            if params.maskImage != nil { throw ImageInputError.unreadable("mask_image is not supported for video") }
+            if params.batchCount != 1 { throw GenerationError.invalid("batch_count must be 1 for video.") }
+            if let n = params.numFrames, n > guardrails.maxFrames {
+                throw VideoOutputError.tooManyFrames(n, guardrails.maxFrames)
+            }
+            let version = (try? await catalog())?.checkpoint(file: params.model)?.version
+            if VideoOutput.isKnownImageModel(params.model, version: version) {
+                throw VideoOutputError.notAVideoModel(params.model)
+            }
+        }
+        // A video start frame should be followed closely; image edits default lower.
+        let strength = params.strength ?? (maskCG != nil || isVideo ? 1.0 : 0.7)
         guard (0...1).contains(strength) else { throw ImageInputError.strengthOutOfRange(strength) }
-        let kind = maskCG != nil ? "inpaint" : (initCG != nil ? "img2img" : "image")
+        let kind = isVideo ? "video" : (maskCG != nil ? "inpaint" : (initCG != nil ? "img2img" : "image"))
 
         try guardrails.check(
             width: params.width, height: params.height, steps: params.steps,
@@ -165,7 +182,7 @@ public actor GenerationManager {
         let note: String? = initCG.map { _ in
             let pct = maskedFraction.map { ", \(Int(($0 * 100).rounded()))% of the image regenerated" } ?? ""
             return "canvas \(params.width)x\(params.height), strength \(strength)\(pct)"
-        }
+        } ?? (isVideo ? "canvas \(params.width)x\(params.height), \(params.numFrames ?? 0) frames" : nil)
         await jobs.update(job.id) { $0.seed = seed; $0.note = note }
 
         var cfg = DrawThingsConfiguration()
@@ -179,6 +196,7 @@ public actor GenerationManager {
         cfg.seed = seed
         cfg.batchCount = Int32(params.batchCount)
         cfg.loras = params.loras.map { LoRAConfig(file: $0.file, weight: Float($0.weight)) }
+        if let n = params.numFrames { cfg.numFrames = Int32(n) }
         if initCG != nil {
             cfg.strength = Float(strength)
             // Dedicated inpainting checkpoints need the inpaint control enabled.
@@ -209,8 +227,20 @@ public actor GenerationManager {
                         }
                     }
                 }
-                let paths = try OutputManager.writeImages(
-                    result.images, jobID: jobID, into: outDir)
+                let paths: [String]
+                if isVideo {
+                    await jobs.update(jobID) { $0.stage = "Assembling video"; $0.step = nil }
+                    let fps = result.media.frameRate ?? 16
+                    let out = try await VideoOutput.write(
+                        frames: result.images, frameRate: fps, audio: result.audio.first,
+                        jobID: jobID, into: outDir)
+                    paths = [out.video, out.poster]
+                    await jobs.update(jobID) {
+                        $0.note = "\($0.note ?? ""), \(result.images.count) frames at \(fps) fps; outputs are [video.mp4, first_frame.png]"
+                    }
+                } else {
+                    paths = try OutputManager.writeImages(result.images, jobID: jobID, into: outDir)
+                }
                 await jobs.update(jobID) { $0.outputs = paths; $0.status = .completed }
             } catch is CancellationError {
                 await jobs.update(jobID) { $0.status = .cancelled }
