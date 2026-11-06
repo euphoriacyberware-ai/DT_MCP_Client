@@ -10,6 +10,7 @@ struct ContentView: View {
             ConnectionTab().tabItem { Label("Connection", systemImage: "network") }
             ServerTab().tabItem { Label("MCP Server", systemImage: "server.rack") }
             FoldersTab().tabItem { Label("Folders", systemImage: "folder") }
+            SkillTab().tabItem { Label("Skill", systemImage: "book") }
             ActivityTab().tabItem { Label("Activity", systemImage: "list.bullet") }
         }
         .padding()
@@ -150,5 +151,55 @@ private struct ActivityTab: View {
                 .frame(height: 120)
         }
         .task { await model.refreshJobs() }
+    }
+}
+
+private struct SkillTab: View {
+    @State private var message: String?
+    @State private var failed = false
+
+    var body: some View {
+        Form {
+            Section("Agent skill") {
+                Text("A skill is a short guide that teaches an AI agent how to use these tools well: the order to call them, safe settings, and what to do when something fails.")
+                Text("Export it into the folder your agent harness reads skills from, or copy the text into the agent's instructions. It never contains your token.")
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Export skill folder…") { export() }
+                    Button("Copy SKILL.md text") { copyText() }
+                }
+                if let message {
+                    Text(message).foregroundStyle(failed ? .red : .green).textSelection(.enabled)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func export() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.message = "Choose the folder your agent loads skills from. A 'drawthings-mcp' folder will be created inside it."
+        panel.prompt = "Export Here"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let out = try SkillExporter.export(to: url)
+            message = "Exported to \(out.path)"; failed = false
+        } catch {
+            message = error.localizedDescription; failed = true
+        }
+    }
+
+    private func copyText() {
+        do {
+            let text = try SkillExporter.skillText()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            message = "Copied \(text.count) characters."; failed = false
+        } catch {
+            message = error.localizedDescription; failed = true
+        }
     }
 }

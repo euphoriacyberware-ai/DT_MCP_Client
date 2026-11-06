@@ -31,7 +31,8 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
-            ]
+            ],
+            resources: [.copy("Resources/skill")]
         ),
         // SwiftUI app. Packaged into a sandboxed, signed .app by Scripts/build-app.sh.
         .executableTarget(

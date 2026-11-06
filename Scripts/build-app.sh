@@ -19,10 +19,13 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/DTMCPClient" "$APP/Contents/MacOS/DTMCPClient"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/Icon/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # SwiftPM resource bundles (library model specs, etc.)
 for b in "$BIN"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
 
-codesign --force --options runtime --timestamp=none \
+# Distribution identities need a secure timestamp for notarization.
+TS="--timestamp=none"; [[ "$IDENTITY" == Developer\ ID* ]] && TS="--timestamp"
+codesign --force --options runtime $TS \
     --entitlements "$ROOT/Resources/DTMCPClient.entitlements" \
     --sign "$IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
