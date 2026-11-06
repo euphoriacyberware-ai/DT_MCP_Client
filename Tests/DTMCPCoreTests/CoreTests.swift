@@ -313,3 +313,45 @@ import AVFoundation
         if case .text(let t, _, _) = video.content.first { #expect(t.contains("not supported")) }
     }
 }
+
+// MARK: - Skill
+
+@Suite struct SkillTests {
+    @Test func bundledSkillHasFrontmatter() throws {
+        let text = try SkillExporter.skillText()
+        #expect(text.hasPrefix("---\nname: drawthings-mcp\n"))
+        #expect(text.contains("description:"))
+    }
+
+    /// Every tool the server offers should be mentioned in the skill, so agents learn about it.
+    @Test func skillMentionsEveryTool() throws {
+        let text = try SkillExporter.skillText()
+        for tool in MCPToolbox.tools { #expect(text.contains(tool.name), "skill does not mention \(tool.name)") }
+    }
+
+    /// Argument names used in the skill's recipes must exist in the tool schemas.
+    @Test func recipeArgumentsExist() throws {
+        let text = try SkillExporter.skillText()
+        let image = MCPToolbox.tools.first { $0.name == "generate_image" }!
+        let video = MCPToolbox.tools.first { $0.name == "generate_video" }!
+        func props(_ t: Tool) -> Set<String> {
+            guard case .object(let o) = t.inputSchema, case .object(let p)? = o["properties"] else { return [] }
+            return Set(p.keys)
+        }
+        for arg in ["init_image", "mask_image", "mask_mode", "strength", "controls", "upscaler", "width", "height"] {
+            #expect(text.contains(arg) && props(image).contains(arg), "\(arg)")
+        }
+        for arg in ["num_frames", "init_image"] { #expect(props(video).contains(arg), "\(arg)") }
+    }
+
+    @Test func exportsAndReplaces() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dtmcp-skill-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = try SkillExporter.export(to: dir)
+        try "stale".write(to: a.appendingPathComponent("old.txt"), atomically: true, encoding: .utf8)
+        let b = try SkillExporter.export(to: dir)  // second export replaces the first
+        #expect(FileManager.default.fileExists(atPath: b.appendingPathComponent("SKILL.md").path))
+        #expect(!FileManager.default.fileExists(atPath: b.appendingPathComponent("old.txt").path))
+    }
+}

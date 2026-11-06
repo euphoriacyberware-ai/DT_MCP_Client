@@ -29,6 +29,8 @@ public struct ImageJobParams: Sendable {
     public var numFrames: Int?
     /// ControlNets to apply; each carries its own prepared control map (depth map, edges, pose, ...).
     public var controls: [ControlInput] = []
+    /// Upscaler file; the finished image is upscaled by the factor the upscaler is made for.
+    public var upscaler: String?
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -185,6 +187,17 @@ public actor GenerationManager {
             }
             hints = try builder.build()
         }
+        // Upscaler: must be installed when we can see the server's catalog.
+        var upscaleFactor: Int32 = 0
+        if let up = params.upscaler {
+            let cat = try? await catalog()
+            if let cat, !cat.isEmpty {
+                guard let u = cat.upscalers.first(where: { $0.file == up }) else {
+                    throw GenerationError.invalid("Upscaler '\(up)' is not installed. Call list_upscalers for valid files.")
+                }
+                upscaleFactor = Int32(u.scaleFactor ?? 0)
+            }
+        }
         let isVideo = params.numFrames != nil
         if isVideo {
             if params.maskImage != nil { throw ImageInputError.unreadable("mask_image is not supported for video") }
@@ -216,7 +229,8 @@ public actor GenerationManager {
         } ?? (isVideo ? "canvas \(params.width)x\(params.height), \(params.numFrames ?? 0) frames" : nil)
         let controlNote = params.controls.isEmpty ? nil
             : "controls: " + params.controls.map { "\($0.hintType) via \($0.file)" }.joined(separator: ", ")
-        let fullNote = [note, controlNote].compactMap { $0 }.joined(separator: "; ")
+        let upNote = params.upscaler.map { "upscaler: \($0)" }
+        let fullNote = [note, controlNote, upNote].compactMap { $0 }.joined(separator: "; ")
         await jobs.update(job.id) { $0.seed = seed; $0.note = fullNote.isEmpty ? nil : fullNote }
 
         var cfg = DrawThingsConfiguration()
@@ -231,6 +245,7 @@ public actor GenerationManager {
         cfg.batchCount = Int32(params.batchCount)
         cfg.loras = params.loras.map { LoRAConfig(file: $0.file, weight: Float($0.weight)) }
         cfg.controls = controlConfigs
+        if let up = params.upscaler { cfg.upscaler = up; cfg.upscalerScaleFactor = upscaleFactor }
         if let n = params.numFrames { cfg.numFrames = Int32(n) }
         if initCG != nil {
             cfg.strength = Float(strength)

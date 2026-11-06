@@ -76,6 +76,7 @@ public struct MCPToolbox: Sendable {
                     "mask_image": prop("string", "Absolute path of a mask image for inpaint (needs init_image). Same shape as init_image is best."),
                     "mask_mode": prop("string", "Which mask pixels get regenerated: 'white' (default), 'black', or 'alpha' (transparent)."),
                     "batch_count": prop("integer", "Number of images."),
+                    "upscaler": prop("string", "Upscaler file from list_upscalers. The result is upscaled by that upscaler's factor (e.g. 2x), so the saved image is larger than width x height."),
                     "controls": .object([
                         "type": "array",
                         "description": "ControlNets that steer the layout. Each 'image' must already be the control map (a depth map, edge image, pose skeleton, scribble...), not an ordinary photo. The control file must be compatible with the model: use list_controlnets with compatible_with.",
@@ -211,6 +212,7 @@ public struct MCPToolbox: Sendable {
                 guard let n = a["num_frames"]?.intValue, n >= 2 else { throw ToolError("'num_frames' is required and must be at least 2.") }
                 a["batch_count"] = nil
                 a.removeValue(forKey: "mask_image")
+                a.removeValue(forKey: "upscaler")
                 if a["controls"] != nil { throw ToolError("controls are not supported for generate_video.") }
                 return json(try await generateImage(a, numFrames: n))
             case "get_job":
@@ -272,6 +274,7 @@ public struct MCPToolbox: Sendable {
             throw ToolError("mask_image needs init_image too.")
         }
         if let mp = a["mask_image"]?.stringValue, !mp.isEmpty { p.maskImage = mp }
+        if let up = a["upscaler"]?.stringValue, !up.isEmpty { p.upscaler = up }
         for item in a["controls"]?.arrayValue ?? [] {
             guard let o = item.objectValue, let file = o["file"]?.stringValue, !file.isEmpty,
                 let image = o["image"]?.stringValue, !image.isEmpty
