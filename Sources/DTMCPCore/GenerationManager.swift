@@ -67,6 +67,7 @@ public actor GenerationManager {
         self.defaults = defaults
         self.guardrails = guardrails
         let old = service
+        cachedCatalog = nil
         self.endpoint = endpoint
         var options = ConnectionOptions()
         options.security = endpoint.useTLS ? .tls() : .plaintext
@@ -90,6 +91,20 @@ public actor GenerationManager {
         } catch {
             return ["connected": "false", "error": error.localizedDescription]
         }
+    }
+
+    // MARK: Catalog
+
+    private var cachedCatalog: ModelCatalog?
+
+    /// Installed models, LoRAs, ControlNets and upscalers, cached for 30 seconds.
+    public func catalog(forceRefresh: Bool = false) async throws -> ModelCatalog {
+        if !forceRefresh, let c = cachedCatalog, Date().timeIntervalSince(c.fetchedAt) < 30 { return c }
+        guard let service else { throw GenerationError.notConfigured }
+        let reply = try await service.echo()
+        let c = ModelCatalog.parse(reply.override)
+        cachedCatalog = c
+        return c
     }
 
     // MARK: Jobs

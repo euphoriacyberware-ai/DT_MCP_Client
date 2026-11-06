@@ -2,3 +2,5 @@
 /reference
 /.build
 /.swiftpm
+.build/
+*.xcodeproj/xcuserdata/

@@ -17,12 +17,38 @@ public struct MCPToolbox: Sendable {
         .object(["type": .string(type), "description": .string(desc)])
     }
 
+    private static func listTool(_ name: String, _ desc: String, compat: Bool) -> Tool {
+        var props: [String: Value] = [
+            "query": prop("string", "Only entries whose name or file contains this text."),
+            "limit": prop("integer", "Max entries to return, default 50."),
+            "include_deprecated": prop("boolean", "Include models Draw Things has replaced. Default false."),
+        ]
+        if compat { props["compatible_with"] = prop("string", "Model file name; only compatible entries are returned.") }
+        return Tool(
+            name: name, description: desc,
+            inputSchema: .object(["type": "object", "properties": .object(props)]),
+            annotations: .init(title: name, readOnlyHint: true))
+    }
+
     public static let tools: [Tool] = [
         Tool(
             name: "get_server_status",
             description: "Check whether the Draw Things server is reachable. Call this first.",
             inputSchema: .object(["type": "object", "properties": .object([:])]),
             annotations: .init(title: "Server status", readOnlyHint: true)),
+        listTool("list_models", "List checkpoint models installed on the Draw Things server. Use the returned 'file' as the model for generate_image.", compat: false),
+        listTool("list_loras", "List installed LoRAs. Pass compatible_with (a model file) to see only LoRAs that fit that model. Use 'trigger_prefix' text in your prompt if present.", compat: true),
+        listTool("list_controlnets", "List installed ControlNet models, optionally only those compatible with a model.", compat: true),
+        listTool("list_upscalers", "List installed upscaler models.", compat: false),
+        Tool(
+            name: "get_model_recommendations",
+            description: "Suggested sampler, steps, guidance, shift and size for a model file. Call this before generate_image with a model you have not used.",
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object(["model": prop("string", "Model file name from list_models.")]),
+                "required": .array([.string("model")]),
+            ]),
+            annotations: .init(title: "Model recommendations", readOnlyHint: true)),
         Tool(
             name: "generate_image",
             description: """
@@ -104,6 +130,26 @@ public struct MCPToolbox: Sendable {
             switch name {
             case "get_server_status":
                 return json(await manager.status())
+            case "list_models", "list_loras", "list_controlnets", "list_upscalers":
+                let catalog = try await manager.catalog()
+                var o = CatalogQuery.Options()
+                o.query = args?["query"]?.stringValue
+                o.limit = args?["limit"]?.intValue ?? 50
+                o.includeDeprecated = args?["include_deprecated"]?.boolValue ?? false
+                o.compatibleWith = args?["compatible_with"]?.stringValue
+                if let m = o.compatibleWith, catalog.checkpoint(file: m) == nil {
+                    throw ToolError("compatible_with '\(m)' is not an installed model. Call list_models first.")
+                }
+                switch name {
+                case "list_models": return json(CatalogQuery.checkpoints(catalog, o))
+                case "list_loras": return json(CatalogQuery.loras(catalog, o))
+                case "list_controlnets": return json(CatalogQuery.controlNets(catalog, o))
+                default: return json(CatalogQuery.upscalers(catalog, o))
+                }
+            case "get_model_recommendations":
+                let model = try requireString(args, "model")
+                let catalog = try await manager.catalog()
+                return json(ModelPresets.recommend(model: model, catalog: catalog, defaults: await manager.defaults))
             case "generate_image":
                 return json(try await generateImage(args ?? [:]))
             case "get_job":
