@@ -10,7 +10,7 @@ You control a Draw Things server through MCP tools. Generation is **asynchronous
 ## The workflow (follow in order)
 
 1. `get_server_status`. If `connected` is not `"true"`, stop and tell the user what the `error` says. Do not retry in a loop.
-2. `list_models` (use `query` to narrow). Pick a model. Never invent a file name; use the `file` value exactly.
+2. `list_models` (use `query` to narrow). Pick a model. Never invent a file name; use the `file` value exactly. If the user already told you which model to use, check the list but do not switch models when it is missing (see the rules below).
 3. `get_model_recommendations` with that model. Use the returned `native_size` for width and height.
    - If it returns `sampler`, `steps`, `guidance_scale` and `shift`, pass them.
    - If they are missing, do not guess. Omit them to use the user's defaults, or ask the user what the model needs.
@@ -37,7 +37,8 @@ Jobs run one at a time. If you start several, they queue in order.
 ## Rules that prevent most failures
 
 - `width` and `height` must be positive **multiples of 64**. Stay near the model's `native_size`; much larger sizes are slow and often rejected by the user's limits.
-- Use **only** model, LoRA, ControlNet and upscaler file names that the list tools returned.
+- Use model, LoRA, ControlNet and upscaler file names that the list tools returned. **Exception: the user named it.** The server's lists can be incomplete. If the user gives an exact file name (for example `my_model_q8p.ckpt`) that is missing from the list, pass it exactly as written. `generate_image` does not reject unlisted model or LoRA names; the server will say if it truly lacks the file. Never swap in a different model or LoRA because the list lacks the one requested.
+- **Never guess settings.** If a model has no recommendation (`get_model_recommendations` returns no sampler, steps, guidance or shift), do not invent values from similar models. Use the user's stated settings, or omit them and use the app defaults, or ask the user. One wrong value can produce no image or a bad one.
 - A LoRA or ControlNet must match the model's family. Use `compatible_with` with the model file when listing.
 - If a LoRA has a `trigger_prefix`, include that text in your prompt.
 - Image paths you pass in (`init_image`, `mask_image`, control `image`) must be **absolute paths inside a folder the user granted** in the app. The output folder counts, so you can refine earlier results. If a call says the path is outside the granted folders, ask the user to add that folder in the app. Do not try other locations.
@@ -108,7 +109,7 @@ generate_video { prompt, model, num_frames, width, height }   // optional init_i
 | "Unknown sampler" | Use one of the sampler names the message lists. |
 | "The server returned no image" | The sampler, steps, guidance or shift do not suit the model. Call `get_model_recommendations`, use its values, or ask the user for the model's recommended settings. Do not retry the same settings. |
 | "is not installed" or "different model family" | Call the matching list tool with `compatible_with` and choose from the result. |
-| List is empty | The server may have "Enable Model Browsing" off, or nothing matches. Try without `query`; otherwise ask the user. |
+| List is empty, or the model/LoRA you were asked to use is not in it | The server's list may be incomplete or "Enable Model Browsing" may be off. Try once without `query`. If the user gave the exact file name, use it as written. If they only described it, ask for the file name. Do not substitute another model or guess its settings. |
 | Job `cancelled` | Someone cancelled it. Ask before starting it again. |
 
 If a tool returns `isError`, read its message: it tells you what to change. Make one corrected attempt, then report to the user instead of looping.
