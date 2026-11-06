@@ -258,3 +258,58 @@ import AVFoundation
         #expect(t != nil)
     }
 }
+
+// MARK: - ControlNet
+
+@Suite struct ControlTests {
+    @Test func infersHintTypeFromFileName() {
+        #expect(ControlHints.infer(from: "controlnet_depth_sdxl_f16.ckpt") == "depth")
+        #expect(ControlHints.infer(from: "control_openpose_sd15.ckpt") == "pose")
+        #expect(ControlHints.infer(from: "xinsir_canny_sdxl.ckpt") == "canny")
+        #expect(ControlHints.infer(from: "t2i_adapter_softedge.ckpt") == "softedge")  // not "canny"/"depth"
+        #expect(ControlHints.infer(from: "mystery_net.ckpt") == nil)
+    }
+
+    static func catalog() -> ModelCatalog {
+        var o = MetadataOverride()
+        o.models = Data(#"[{"name":"SD","file":"sd.ckpt","version":"v1","default_scale":8}]"#.utf8)
+        o.controlNets = Data(#"[{"name":"Depth","file":"depth_sd15.ckpt","version":"v1"},{"name":"XL","file":"depth_xl.ckpt","version":"sdxl_base_v0.9"}]"#.utf8)
+        return ModelCatalog.parse(o)
+    }
+
+    @Test func validation() throws {
+        let c = Self.catalog()
+        func ctl(_ f: String, hint: String = "depth") -> ControlInput { ControlInput(file: f, imagePath: "/x.png", hintType: hint) }
+
+        try ControlHints.validate(ctl("depth_sd15.ckpt"), model: "sd.ckpt", catalog: c)
+        #expect(throws: ControlInputError.self) { try ControlHints.validate(ctl("nope.ckpt"), model: "sd.ckpt", catalog: c) }
+        #expect(throws: ControlInputError.self) { try ControlHints.validate(ctl("depth_xl.ckpt"), model: "sd.ckpt", catalog: c) }
+        #expect(throws: ControlInputError.self) { try ControlHints.validate(ctl("depth_sd15.ckpt", hint: "bogus"), model: "sd.ckpt", catalog: c) }
+        // Server lists models but no ControlNets at all: any control is rejected.
+        var noNets = MetadataOverride()
+        noNets.models = Data(#"[{"name":"SD","file":"sd.ckpt","version":"v1"}]"#.utf8)
+        #expect(throws: ControlInputError.self) {
+            try ControlHints.validate(ctl("depth_sd15.ckpt"), model: "sd.ckpt", catalog: ModelCatalog.parse(noNets))
+        }
+        // Model browsing off: can't verify, so allow.
+        try ControlHints.validate(ctl("anything.ckpt"), model: "sd.ckpt", catalog: ModelCatalog())
+
+        var bad = ctl("depth_sd15.ckpt"); bad.guidanceStart = 0.8; bad.guidanceEnd = 0.2
+        #expect(throws: ControlInputError.self) { try ControlHints.validate(bad, model: "sd.ckpt", catalog: c) }
+        var heavy = ctl("depth_sd15.ckpt"); heavy.weight = 5
+        #expect(throws: ControlInputError.self) { try ControlHints.validate(heavy, model: "sd.ckpt", catalog: c) }
+    }
+
+    @Test func toolRejectsMalformedControls() async {
+        let box = MCPToolbox(manager: GenerationManager(jobs: JobStore(), folders: FolderAccess(defaults: UserDefaults(suiteName: "dtmcp-\(UUID().uuidString)")!)))
+        let missing = await box.call("generate_image", ["prompt": "x", "controls": .array([.object(["file": "a.ckpt"])])])
+        #expect(missing.isError == true)
+        let noHint = await box.call("generate_image", ["prompt": "x", "controls": .array([.object(["file": "mystery.ckpt", "image": "/x.png"])])])
+        #expect(noHint.isError == true)
+        if case .text(let t, _, _) = noHint.content.first { #expect(t.contains("hint_type")) }
+        let badMode = await box.call("generate_image", ["prompt": "x", "controls": .array([.object(["file": "depth.ckpt", "image": "/x.png", "mode": "wild"])])])
+        if case .text(let t, _, _) = badMode.content.first { #expect(t.contains("mode")) }
+        let video = await box.call("generate_video", ["prompt": "x", "model": "wan.ckpt", "num_frames": 33, "controls": .array([])])
+        if case .text(let t, _, _) = video.content.first { #expect(t.contains("not supported")) }
+    }
+}

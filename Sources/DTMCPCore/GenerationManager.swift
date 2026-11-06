@@ -27,6 +27,8 @@ public struct ImageJobParams: Sendable {
     public var sizeFromImage = false
     /// Set for video jobs: number of frames to generate. Requires a video model.
     public var numFrames: Int?
+    /// ControlNets to apply; each carries its own prepared control map (depth map, edges, pose, ...).
+    public var controls: [ControlInput] = []
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -154,6 +156,35 @@ public actor GenerationManager {
                 maskedFraction = ImageInputs.regeneratedFraction(maskCG!)
             }
         }
+        // ControlNets: validate against the server's catalog, then load and size each control map.
+        var hints: [HintProto] = []
+        var controlConfigs: [ControlConfig] = []
+        if !params.controls.isEmpty {
+            guard params.controls.count <= ControlHints.maxControls else {
+                throw ControlInputError.tooMany(params.controls.count)
+            }
+            let cat = try? await catalog()
+            var maps: [CGImage] = []
+            for c in params.controls {
+                try ControlHints.validate(c, model: params.model, catalog: cat)
+                maps.append(try await ImageInputs.load(path: c.imagePath, folders: folders))
+            }
+            // With no init image and no explicit size, the first control map sets the canvas.
+            if initCG == nil, params.sizeFromImage {
+                let size = ImageInputs.canvasSize(for: maps[0], maxPixels: max(defaults.width * defaults.height, 64 * 64))
+                params.width = size.width
+                params.height = size.height
+            }
+            var builder = HintBuilder()
+            for (c, map) in zip(params.controls, maps) {
+                let fitted = ImageInputs.fit(map, width: params.width, height: params.height)
+                builder.addHint(type: c.hintType, imageData: try ImageHelpers.pngData(for: fitted), weight: Float(c.weight))
+                controlConfigs.append(ControlConfig(
+                    file: c.file, weight: Float(c.weight), guidanceStart: Float(c.guidanceStart),
+                    guidanceEnd: Float(c.guidanceEnd), controlMode: c.mode))
+            }
+            hints = try builder.build()
+        }
         let isVideo = params.numFrames != nil
         if isVideo {
             if params.maskImage != nil { throw ImageInputError.unreadable("mask_image is not supported for video") }
@@ -183,7 +214,10 @@ public actor GenerationManager {
             let pct = maskedFraction.map { ", \(Int(($0 * 100).rounded()))% of the image regenerated" } ?? ""
             return "canvas \(params.width)x\(params.height), strength \(strength)\(pct)"
         } ?? (isVideo ? "canvas \(params.width)x\(params.height), \(params.numFrames ?? 0) frames" : nil)
-        await jobs.update(job.id) { $0.seed = seed; $0.note = note }
+        let controlNote = params.controls.isEmpty ? nil
+            : "controls: " + params.controls.map { "\($0.hintType) via \($0.file)" }.joined(separator: ", ")
+        let fullNote = [note, controlNote].compactMap { $0 }.joined(separator: "; ")
+        await jobs.update(job.id) { $0.seed = seed; $0.note = fullNote.isEmpty ? nil : fullNote }
 
         var cfg = DrawThingsConfiguration()
         cfg.width = Int32(params.width)
@@ -196,6 +230,7 @@ public actor GenerationManager {
         cfg.seed = seed
         cfg.batchCount = Int32(params.batchCount)
         cfg.loras = params.loras.map { LoRAConfig(file: $0.file, weight: Float($0.weight)) }
+        cfg.controls = controlConfigs
         if let n = params.numFrames { cfg.numFrames = Int32(n) }
         if initCG != nil {
             cfg.strength = Float(strength)
@@ -208,7 +243,7 @@ public actor GenerationManager {
         }
         let request = GenerationRequest(
             prompt: params.prompt, negativePrompt: params.negativePrompt, configuration: cfg,
-            image: initCG, mask: maskCG)
+            image: initCG, mask: maskCG, hints: hints)
 
         let previous = tail
         let jobs = self.jobs

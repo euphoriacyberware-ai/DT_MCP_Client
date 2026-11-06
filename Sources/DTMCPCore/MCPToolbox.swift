@@ -76,6 +76,23 @@ public struct MCPToolbox: Sendable {
                     "mask_image": prop("string", "Absolute path of a mask image for inpaint (needs init_image). Same shape as init_image is best."),
                     "mask_mode": prop("string", "Which mask pixels get regenerated: 'white' (default), 'black', or 'alpha' (transparent)."),
                     "batch_count": prop("integer", "Number of images."),
+                    "controls": .object([
+                        "type": "array",
+                        "description": "ControlNets that steer the layout. Each 'image' must already be the control map (a depth map, edge image, pose skeleton, scribble...), not an ordinary photo. The control file must be compatible with the model: use list_controlnets with compatible_with.",
+                        "items": .object([
+                            "type": "object",
+                            "properties": .object([
+                                "file": prop("string", "ControlNet file name from list_controlnets."),
+                                "image": prop("string", "Absolute path of the control map image."),
+                                "hint_type": prop("string", "What kind of map it is: depth, canny, pose, scribble, softedge, lineart, seg, mlsd, tile, shuffle. Usually inferred from the file name."),
+                                "weight": prop("number", "0-2, default 1.0."),
+                                "guidance_start": prop("number", "0-1, fraction of steps where control begins. Default 0."),
+                                "guidance_end": prop("number", "0-1, fraction where control ends. Default 1; lower (e.g. 0.7) gives the model more freedom."),
+                                "mode": prop("string", "balanced (default), prompt (favor the prompt) or control (favor the map)."),
+                            ]),
+                            "required": .array([.string("file"), .string("image")]),
+                        ]),
+                    ]),
                     "loras": .object([
                         "type": "array",
                         "description": "LoRAs to apply.",
@@ -194,6 +211,7 @@ public struct MCPToolbox: Sendable {
                 guard let n = a["num_frames"]?.intValue, n >= 2 else { throw ToolError("'num_frames' is required and must be at least 2.") }
                 a["batch_count"] = nil
                 a.removeValue(forKey: "mask_image")
+                if a["controls"] != nil { throw ToolError("controls are not supported for generate_video.") }
                 return json(try await generateImage(a, numFrames: n))
             case "get_job":
                 let id = try requireString(args, "job_id")
@@ -254,6 +272,24 @@ public struct MCPToolbox: Sendable {
             throw ToolError("mask_image needs init_image too.")
         }
         if let mp = a["mask_image"]?.stringValue, !mp.isEmpty { p.maskImage = mp }
+        for item in a["controls"]?.arrayValue ?? [] {
+            guard let o = item.objectValue, let file = o["file"]?.stringValue, !file.isEmpty,
+                let image = o["image"]?.stringValue, !image.isEmpty
+            else { throw ToolError("Each control needs 'file' and 'image'.") }
+            let hint: String
+            if let h = o["hint_type"]?.stringValue { hint = h.lowercased() }
+            else if let guess = ControlHints.infer(from: file) { hint = guess }
+            else { throw ControlInputError.cannotInferHint(file) }
+            var c = ControlInput(file: file, imagePath: image, hintType: hint)
+            c.weight = o["weight"]?.doubleValue ?? 1.0
+            c.guidanceStart = o["guidance_start"]?.doubleValue ?? 0.0
+            c.guidanceEnd = o["guidance_end"]?.doubleValue ?? 1.0
+            if let m = o["mode"]?.stringValue { c.mode = try ControlHints.parseMode(m) }
+            p.controls.append(c)
+        }
+        if p.initImage == nil, !p.controls.isEmpty {
+            p.sizeFromImage = a["width"] == nil && a["height"] == nil
+        }
         if let m = a["mask_mode"]?.stringValue {
             guard let mode = MaskMode(rawValue: m.lowercased()) else { throw ImageInputError.invalidMode(m) }
             p.maskMode = mode
