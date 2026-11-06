@@ -8,6 +8,8 @@
     <string>DT MCP Client</string>
     <key>CFBundleDisplayName</key>
     <string>DT MCP Client</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleExecutable</key>
     <string>DTMCPClient</string>
     <key>CFBundlePackageType</key>
@@ -18,6 +20,8 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.graphics-design</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
