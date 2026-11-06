@@ -15,6 +15,8 @@ public struct Job: Codable, Sendable, Identifiable {
     public var totalSteps: Int?
     public var outputs: [String]
     public var error: String?
+    /// Extra facts about the inputs, e.g. canvas size, strength and mask coverage.
+    public var note: String?
     public var prompt: String
     public var model: String
     public var seed: UInt32?
@@ -42,7 +44,7 @@ public actor JobStore {
         let id = "job_" + UUID().uuidString.prefix(8).lowercased()
         let job = Job(
             id: id, kind: kind, status: .queued, stage: nil, step: nil, totalSteps: nil,
-            outputs: [], error: nil, prompt: prompt, model: model, seed: nil,
+            outputs: [], error: nil, note: nil, prompt: prompt, model: model, seed: nil,
             createdAt: Date(), finishedAt: nil, durationSeconds: nil)
         jobs[id] = job
         order.append(id)

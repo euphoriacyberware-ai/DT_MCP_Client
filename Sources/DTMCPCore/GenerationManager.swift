@@ -1,3 +1,4 @@
+import CoreGraphics
 import DrawThingsClient
 import Foundation
 
@@ -15,6 +16,15 @@ public struct ImageJobParams: Sendable {
     public var seed: UInt32?
     public var batchCount: Int = 1
     public var loras: [(file: String, weight: Double)] = []
+    /// Path to an init image (img2img). Must be inside a folder the user granted.
+    public var initImage: String?
+    /// Path to a mask image (inpaint). Requires `initImage`.
+    public var maskImage: String?
+    public var maskMode: MaskMode = .white
+    /// 0...1. Defaults to 0.7 for img2img and 1.0 for inpaint.
+    public var strength: Double?
+    /// When true, width/height are derived from the init image instead of the values above.
+    public var sizeFromImage = false
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -115,16 +125,48 @@ public actor GenerationManager {
         guard let sampler = SamplerNames.map[params.sampler.lowercased()] else {
             throw GenerationError.unknownSampler(params.sampler)
         }
+        var params = params
+        let outDir = try await folders.outputFolder()
+
+        // Load and prepare img2img / inpaint inputs up front so problems come back to the agent immediately.
+        var initCG: CGImage?
+        var maskCG: CGImage?
+        var maskedFraction: Double?
+        if params.maskImage != nil && params.initImage == nil {
+            throw ImageInputError.unreadable("mask_image requires init_image")
+        }
+        if let path = params.initImage {
+            let img = try await ImageInputs.load(path: path, folders: folders)
+            if params.sizeFromImage {
+                let size = ImageInputs.canvasSize(for: img, maxPixels: max(defaults.width * defaults.height, 64 * 64))
+                params.width = size.width
+                params.height = size.height
+            }
+            initCG = ImageInputs.fit(img, width: params.width, height: params.height)
+            if let mp = params.maskImage {
+                let raw = try await ImageInputs.load(path: mp, folders: folders)
+                maskCG = try ImageInputs.drawThingsMask(
+                    from: raw, mode: params.maskMode, width: params.width, height: params.height)
+                maskedFraction = ImageInputs.regeneratedFraction(maskCG!)
+            }
+        }
+        let strength = params.strength ?? (maskCG != nil ? 1.0 : 0.7)
+        guard (0...1).contains(strength) else { throw ImageInputError.strengthOutOfRange(strength) }
+        let kind = maskCG != nil ? "inpaint" : (initCG != nil ? "img2img" : "image")
+
         try guardrails.check(
             width: params.width, height: params.height, steps: params.steps,
             batchCount: params.batchCount)
-        let outDir = try await folders.outputFolder()
 
         var seed = params.seed
         if seed == nil { seed = UInt32.random(in: 0...UInt32.max) }
 
-        let job = await jobs.create(kind: "image", prompt: params.prompt, model: params.model)
-        await jobs.update(job.id) { $0.seed = seed }
+        let job = await jobs.create(kind: kind, prompt: params.prompt, model: params.model)
+        let note: String? = initCG.map { _ in
+            let pct = maskedFraction.map { ", \(Int(($0 * 100).rounded()))% of the image regenerated" } ?? ""
+            return "canvas \(params.width)x\(params.height), strength \(strength)\(pct)"
+        }
+        await jobs.update(job.id) { $0.seed = seed; $0.note = note }
 
         var cfg = DrawThingsConfiguration()
         cfg.width = Int32(params.width)
@@ -137,8 +179,18 @@ public actor GenerationManager {
         cfg.seed = seed
         cfg.batchCount = Int32(params.batchCount)
         cfg.loras = params.loras.map { LoRAConfig(file: $0.file, weight: Float($0.weight)) }
+        if initCG != nil {
+            cfg.strength = Float(strength)
+            // Dedicated inpainting checkpoints need the inpaint control enabled.
+            if maskCG != nil, let c = try? await catalog(),
+                c.checkpoint(file: params.model)?.modifier == "inpainting"
+            {
+                cfg.enableInpainting = true
+            }
+        }
         let request = GenerationRequest(
-            prompt: params.prompt, negativePrompt: params.negativePrompt, configuration: cfg)
+            prompt: params.prompt, negativePrompt: params.negativePrompt, configuration: cfg,
+            image: initCG, mask: maskCG)
 
         let previous = tail
         let jobs = self.jobs

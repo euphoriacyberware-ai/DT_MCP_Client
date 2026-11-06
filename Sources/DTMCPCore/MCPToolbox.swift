@@ -52,8 +52,11 @@ public struct MCPToolbox: Sendable {
         Tool(
             name: "generate_image",
             description: """
-                Start a text-to-image job. Returns a job_id immediately; then call wait_for_job \
-                (or get_job) to get the saved file paths. Omitted settings use the user's defaults.
+                Start an image job: text-to-image, or img2img when init_image is given, or inpaint \
+                when init_image and mask_image are both given. Returns a job_id immediately; then \
+                call wait_for_job (or get_job) to get the saved file paths. Omitted settings use \
+                the user's defaults. Image paths must be inside a folder the user granted in the app \
+                (the output folder counts, so you can refine earlier results).
                 """,
             inputSchema: .object([
                 "type": "object",
@@ -68,6 +71,10 @@ public struct MCPToolbox: Sendable {
                     "shift": prop("number", "Sampling shift; model-specific."),
                     "sampler": prop("string", "Sampler id, e.g. unipctrailing, eulera, dpmpp2mkarras."),
                     "seed": prop("integer", "Omit for random. The used seed is returned."),
+                    "init_image": prop("string", "Absolute path of a starting image (PNG/JPEG/HEIC) for img2img or inpaint. If width/height are omitted they follow this image's shape."),
+                    "strength": prop("number", "0-1. How much to change init_image. Default 0.7 for img2img, 1.0 for inpaint. Few-step (turbo) models barely change the picture below about 0.8; use 0.85-0.95 for big changes like a new scene or lighting."),
+                    "mask_image": prop("string", "Absolute path of a mask image for inpaint (needs init_image). Same shape as init_image is best."),
+                    "mask_mode": prop("string", "Which mask pixels get regenerated: 'white' (default), 'black', or 'alpha' (transparent)."),
                     "batch_count": prop("integer", "Number of images."),
                     "loras": .object([
                         "type": "array",
@@ -203,6 +210,18 @@ public struct MCPToolbox: Sendable {
             }
             p.loras.append((file, item.objectValue?["weight"]?.doubleValue ?? 1.0))
         }
+        if let ip = a["init_image"]?.stringValue, !ip.isEmpty {
+            p.initImage = ip
+            p.sizeFromImage = a["width"] == nil && a["height"] == nil
+        } else if a["mask_image"] != nil {
+            throw ToolError("mask_image needs init_image too.")
+        }
+        if let mp = a["mask_image"]?.stringValue, !mp.isEmpty { p.maskImage = mp }
+        if let m = a["mask_mode"]?.stringValue {
+            guard let mode = MaskMode(rawValue: m.lowercased()) else { throw ImageInputError.invalidMode(m) }
+            p.maskMode = mode
+        }
+        p.strength = a["strength"]?.doubleValue
         guard p.width % 64 == 0, p.height % 64 == 0, p.width > 0, p.height > 0 else {
             throw ToolError("width and height must be positive multiples of 64.")
         }
