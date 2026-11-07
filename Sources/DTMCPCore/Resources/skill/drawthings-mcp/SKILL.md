@@ -97,6 +97,17 @@ generate_video { prompt, model, num_frames, width, height }   // optional init_i
 - `outputs` is `[the .mp4, the first frame as .png]`. Use the PNG to check the first frame quickly.
 - Video can take many minutes. Keep calling `wait_for_job` with `timeout_seconds` 300 until it finishes.
 - Video does not support `mask_image`, `controls` or `batch_count`.
+- `generate_video` accepts `loras` (for example a speed-up LoRA), and `shift_for_audio` for audio-capable models.
+
+### Use the user's own Draw Things configuration
+If the user gives you settings from Draw Things ("Copy Configuration" JSON, or a file with it), pass it as `config_json` (a JSON string or object) instead of copying values one by one.
+```
+generate_video { prompt, num_frames, config_json: "<the JSON>" }
+```
+- It carries everything the tool has no argument for: LoRAs and their modes, tiled decoding, TeaCache, `shiftForAudio` and more. Numeric samplers (`"sampler": 16`) work as written.
+- Arguments you pass explicitly override it. Change only what the request needs: the `seed` (omit it for a new random one), `num_frames`, the prompt. Leave the rest alone, even if it looks odd.
+- The user's configuration is deliberate for that model. Do not "correct" its sampler, steps, guidance or shift, and do not drop its LoRAs.
+- If the call is rejected for the frame count, tell the user the limit is set in the app's Guardrails.
 
 ## When something goes wrong
 

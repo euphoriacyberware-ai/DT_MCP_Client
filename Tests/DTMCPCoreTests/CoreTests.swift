@@ -341,7 +341,12 @@ import AVFoundation
         for arg in ["init_image", "mask_image", "mask_mode", "strength", "controls", "upscaler", "width", "height"] {
             #expect(text.contains(arg) && props(image).contains(arg), "\(arg)")
         }
-        for arg in ["num_frames", "init_image"] { #expect(props(video).contains(arg), "\(arg)") }
+        for arg in ["num_frames", "init_image", "loras", "shift_for_audio", "config_json"] {
+            #expect(props(video).contains(arg), "\(arg)")
+        }
+        for arg in ["loras", "shift_for_audio", "config_json"] {
+            #expect(props(image).contains(arg) && text.contains(arg), "\(arg)")
+        }
     }
 
     @Test func exportsAndReplaces() throws {
@@ -353,5 +358,55 @@ import AVFoundation
         let b = try SkillExporter.export(to: dir)  // second export replaces the first
         #expect(FileManager.default.fileExists(atPath: b.appendingPathComponent("SKILL.md").path))
         #expect(!FileManager.default.fileExists(atPath: b.appendingPathComponent("old.txt").path))
+    }
+}
+
+
+// MARK: - Draw Things configuration JSON
+
+@Suite struct ConfigJSONTests {
+    /// A "Copy Configuration" export for a video model, as pasted by a user.
+    static let videoConfig = """
+    {"strength":1,"batchCount":1,"seed":868670200,"loras":[{"mode":"all","file":"turbo_lora_f16.ckpt","weight":0.6}],\
+    "model":"video_model_q8p.ckpt","width":1024,"height":576,"upscaler":"","numFrames":226,"guidanceScale":1,\
+    "shiftForAudio":3,"shift":6.5,"steps":6,"seedMode":2,"sampler":16,"tiledDecoding":true,"decodingTileWidth":256,\
+    "teaCache":false,"faceRestoration":"","refinerModel":""}
+    """
+
+    @Test func samplerAcceptsNamesAndNumbers() {
+        #expect(SamplerNames.resolve("ddimtrailing") == .ddimtrailing)
+        #expect(SamplerNames.resolve("16") == .ddimtrailing)
+        #expect(SamplerNames.resolve("DPMPP2MKarras") == .dpmpp2mkarras)
+        #expect(SamplerNames.resolve("99") == nil)
+        #expect(SamplerNames.resolve("nonsense") == nil)
+        #expect(SamplerNames.name(of: .unipctrailing) == "unipctrailing")
+    }
+
+    @Test func overlayKeepsDefaultsForMissingKeys() throws {
+        var base = DrawThingsConfiguration()
+        base.steps = 30
+        base.guidanceScale = 6
+        try base.mergeJSON(#"{"steps": 8, "sampler": 17}"#)
+        #expect(base.steps == 8)
+        #expect(base.guidanceScale == 6)
+        #expect(base.sampler == .unipctrailing)
+    }
+
+    @Test func parsesVideoConfig() throws {
+        var base = DrawThingsConfiguration()
+        try base.mergeJSON(Self.videoConfig)
+        #expect(base.sampler == .ddimtrailing)
+        #expect(base.numFrames == 226)
+        #expect(base.shiftForAudio == 3)
+        #expect(base.shift == 6.5)
+        #expect(base.loras.count == 1 && base.loras[0].file == "turbo_lora_f16.ckpt")
+        #expect(abs(base.loras[0].weight - 0.6) < 0.001)
+        #expect(base.upscaler == nil)
+        #expect(base.seed == 868_670_200)
+    }
+
+    @Test func rejectsUnknownSamplerNumber() {
+        var base = DrawThingsConfiguration()
+        #expect(throws: (any Error).self) { try base.mergeJSON(#"{"sampler": 99}"#) }
     }
 }

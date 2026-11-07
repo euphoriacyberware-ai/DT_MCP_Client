@@ -1,4 +1,5 @@
 import Foundation
+import DrawThingsClient
 import MCP
 
 /// Tool definitions and dispatch. Results are JSON text so small models can read them easily.
@@ -94,18 +95,9 @@ public struct MCPToolbox: Sendable {
                             "required": .array([.string("file"), .string("image")]),
                         ]),
                     ]),
-                    "loras": .object([
-                        "type": "array",
-                        "description": "LoRAs to apply.",
-                        "items": .object([
-                            "type": "object",
-                            "properties": .object([
-                                "file": prop("string", "LoRA file name."),
-                                "weight": prop("number", "Strength, default 1.0."),
-                            ]),
-                            "required": .array([.string("file")]),
-                        ]),
-                    ]),
+                    "loras": Self.lorasProp,
+                    "shift_for_audio": Self.shiftForAudioProp,
+                    "config_json": Self.configJSONProp,
                 ]),
                 "required": .array([.string("prompt")]),
             ]),
@@ -131,10 +123,13 @@ public struct MCPToolbox: Sendable {
                     "steps": prop("integer", "Sampling steps."),
                     "guidance_scale": prop("number", "CFG scale; model-specific."),
                     "shift": prop("number", "Sampling shift; model-specific."),
-                    "sampler": prop("string", "Sampler id."),
+                    "sampler": prop("string", "Sampler name (e.g. ddimtrailing) or Draw Things numeric id (e.g. 16)."),
                     "seed": prop("integer", "Omit for random."),
                     "init_image": prop("string", "Absolute path of a start frame for image-to-video."),
                     "strength": prop("number", "0-1 for init_image; default 1.0."),
+                    "loras": Self.lorasProp,
+                    "shift_for_audio": Self.shiftForAudioProp,
+                    "config_json": Self.configJSONProp,
                 ]),
                 "required": .array([.string("prompt"), .string("model"), .string("num_frames")]),
             ]),
@@ -245,27 +240,61 @@ public struct MCPToolbox: Sendable {
         guard let prompt = a["prompt"]?.stringValue, !prompt.isEmpty else {
             throw ToolError("'prompt' is required.")
         }
+        // Start from the user's defaults; a supplied Draw Things configuration overlays them, and
+        // explicit arguments override both.
+        var base = DrawThingsConfiguration()
+        base.model = d.model
+        base.width = Int32(d.width)
+        base.height = Int32(d.height)
+        base.steps = Int32(d.steps)
+        base.guidanceScale = Float(d.guidanceScale)
+        base.shift = Float(d.shift)
+        base.sampler = SamplerNames.resolve(d.sampler) ?? .dpmpp2mkarras
+        var configGiven = false
+        if let cv = a["config_json"], !(cv.stringValue ?? "x").isEmpty {
+            let text: String
+            if let s = cv.stringValue { text = s }
+            else if let data = try? JSONEncoder().encode(cv), let s = String(data: data, encoding: .utf8) { text = s }
+            else { throw ToolError("config_json must be a JSON string or object.") }
+            do { try base.mergeJSON(text) }
+            catch { throw ToolError("config_json is not a valid Draw Things configuration: \(error.localizedDescription)") }
+            configGiven = true
+        }
+        // A sampler may be given as a name or as the numeric id Draw Things writes.
+        let samplerArg: String? = a["sampler"]?.stringValue ?? a["sampler"]?.intValue.map(String.init)
         var p = ImageJobParams(
             prompt: prompt,
-            model: a["model"]?.stringValue ?? d.model,
-            width: a["width"]?.intValue ?? d.width,
-            height: a["height"]?.intValue ?? d.height,
-            steps: a["steps"]?.intValue ?? d.steps,
-            guidanceScale: a["guidance_scale"]?.doubleValue ?? d.guidanceScale,
-            shift: a["shift"]?.doubleValue ?? d.shift,
-            sampler: a["sampler"]?.stringValue ?? d.sampler)
+            model: a["model"]?.stringValue ?? base.model,
+            width: a["width"]?.intValue ?? Int(base.width),
+            height: a["height"]?.intValue ?? Int(base.height),
+            steps: a["steps"]?.intValue ?? Int(base.steps),
+            guidanceScale: a["guidance_scale"]?.doubleValue ?? Double(base.guidanceScale),
+            shift: a["shift"]?.doubleValue ?? Double(base.shift),
+            sampler: samplerArg ?? SamplerNames.name(of: base.sampler))
         p.numFrames = numFrames
         p.negativePrompt = a["negative_prompt"]?.stringValue ?? ""
-        p.batchCount = max(a["batch_count"]?.intValue ?? 1, 1)
+        p.shiftForAudio = a["shift_for_audio"]?.doubleValue ?? (configGiven ? Double(base.shiftForAudio) : nil)
+        if configGiven {
+            p.baseConfig = base
+            p.batchCount = max(a["batch_count"]?.intValue ?? Int(base.batchCount), 1)
+            p.loras = base.loras.map { ($0.file, Double($0.weight)) }
+            if numFrames == nil { p.upscaler = base.upscaler }
+            if let s = base.seed { p.seed = s }
+        } else {
+            p.batchCount = max(a["batch_count"]?.intValue ?? 1, 1)
+        }
         if let s = a["seed"]?.intValue {
             guard let seed = UInt32(exactly: s) else { throw ToolError("'seed' must be 0...4294967295.") }
             p.seed = seed
         }
-        for item in a["loras"]?.arrayValue ?? [] {
-            guard let file = item.objectValue?["file"]?.stringValue else {
-                throw ToolError("Each lora needs a 'file'.")
+        if let arr = a["loras"]?.arrayValue {
+            p.loras = []
+            for item in arr {
+                guard let file = item.objectValue?["file"]?.stringValue else {
+                    throw ToolError("Each lora needs a 'file'.")
+                }
+                p.loras.append((file, item.objectValue?["weight"]?.doubleValue ?? 1.0))
             }
-            p.loras.append((file, item.objectValue?["weight"]?.doubleValue ?? 1.0))
         }
         if let ip = a["init_image"]?.stringValue, !ip.isEmpty {
             p.initImage = ip
@@ -275,6 +304,7 @@ public struct MCPToolbox: Sendable {
         }
         if let mp = a["mask_image"]?.stringValue, !mp.isEmpty { p.maskImage = mp }
         if let up = a["upscaler"]?.stringValue, !up.isEmpty { p.upscaler = up }
+        else if a["upscaler"] != nil { p.upscaler = nil }
         for item in a["controls"]?.arrayValue ?? [] {
             guard let o = item.objectValue, let file = o["file"]?.stringValue, !file.isEmpty,
                 let image = o["image"]?.stringValue, !image.isEmpty
@@ -297,7 +327,7 @@ public struct MCPToolbox: Sendable {
             guard let mode = MaskMode(rawValue: m.lowercased()) else { throw ImageInputError.invalidMode(m) }
             p.maskMode = mode
         }
-        p.strength = a["strength"]?.doubleValue
+        p.strength = a["strength"]?.doubleValue ?? (configGiven ? Double(base.strength) : nil)
         guard p.width % 64 == 0, p.height % 64 == 0, p.width > 0, p.height > 0 else {
             throw ToolError("width and height must be positive multiples of 64.")
         }
@@ -305,6 +335,25 @@ public struct MCPToolbox: Sendable {
     }
 
     // MARK: Helpers
+
+    static let lorasProp: Value = .object([
+        "type": "array",
+        "description": "LoRAs to apply (image and video). Replaces any LoRAs in config_json.",
+        "items": .object([
+            "type": "object",
+            "properties": .object([
+                "file": prop("string", "LoRA file name."),
+                "weight": prop("number", "Strength, default 1.0."),
+            ]),
+            "required": .array([.string("file")]),
+        ]),
+    ])
+
+    static let shiftForAudioProp: Value = prop("number", "Sampling shift for the audio track of audio-capable video models (Draw Things default 3).")
+
+    static let configJSONProp: Value = prop(
+        "string",
+        "A Draw Things configuration as JSON (the app's 'Copy Configuration' text, or a JSON object). It sets everything this tool has no argument for (LoRA modes, tiled decoding, TeaCache, sampler as a number, shiftForAudio, ...). Any argument you pass explicitly overrides it. Do not edit it beyond seed and frame count unless asked.")
 
     struct ToolError: Error, LocalizedError {
         let message: String

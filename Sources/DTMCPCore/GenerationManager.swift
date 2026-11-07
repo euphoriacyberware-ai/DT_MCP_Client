@@ -31,6 +31,11 @@ public struct ImageJobParams: Sendable {
     public var controls: [ControlInput] = []
     /// Upscaler file; the finished image is upscaled by the factor the upscaler is made for.
     public var upscaler: String?
+    /// Sampling shift for the audio track of audio-capable video models; nil keeps the base value.
+    public var shiftForAudio: Double?
+    /// A configuration parsed from the agent's `config_json`. Every setting this tool has no
+    /// argument for (tiled decoding, TeaCache, LoRA modes, ...) is taken from here.
+    public var baseConfig: DrawThingsConfiguration?
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -58,6 +63,18 @@ public enum SamplerNames {
         "unipctrailing": .unipctrailing, "unipcays": .unipcays, "tcdtrailing": .tcdtrailing,
     ]
     public static var all: [String] { map.keys.sorted() }
+
+    /// Accepts a sampler name, or the numeric id Draw Things writes in its JSON (e.g. "16" = ddimtrailing).
+    public static func resolve(_ s: String) -> SamplerType? {
+        let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if let raw = Int8(t) { return SamplerType(rawValue: raw) }
+        return map[t]
+    }
+
+    /// The tool name for a sampler (inverse of `map`).
+    public static func name(of sampler: SamplerType) -> String {
+        map.first { $0.value == sampler }?.key ?? "dpmpp2mkarras"
+    }
 }
 
 /// Owns the connection to Draw Things and runs jobs one at a time (the server renders serially).
@@ -130,7 +147,7 @@ public actor GenerationManager {
     /// Validates, registers and enqueues a text-to-image job. Returns immediately with the job.
     public func submitImage(_ params: ImageJobParams) async throws -> Job {
         guard let service else { throw GenerationError.notConfigured }
-        guard let sampler = SamplerNames.map[params.sampler.lowercased()] else {
+        guard let sampler = SamplerNames.resolve(params.sampler) else {
             throw GenerationError.unknownSampler(params.sampler)
         }
         var params = params
@@ -233,7 +250,8 @@ public actor GenerationManager {
         let fullNote = [note, controlNote, upNote].compactMap { $0 }.joined(separator: "; ")
         await jobs.update(job.id) { $0.seed = seed; $0.note = fullNote.isEmpty ? nil : fullNote }
 
-        var cfg = DrawThingsConfiguration()
+        let base = params.baseConfig
+        var cfg = base ?? DrawThingsConfiguration()
         cfg.width = Int32(params.width)
         cfg.height = Int32(params.height)
         cfg.steps = Int32(params.steps)
@@ -243,10 +261,18 @@ public actor GenerationManager {
         cfg.shift = Float(params.shift)
         cfg.seed = seed
         cfg.batchCount = Int32(params.batchCount)
-        cfg.loras = params.loras.map { LoRAConfig(file: $0.file, weight: Float($0.weight)) }
+        // Keep a LoRA's mode (all/base/refiner) when it came from the supplied configuration.
+        cfg.loras = params.loras.map { l in
+            LoRAConfig(
+                file: l.file, weight: Float(l.weight),
+                mode: base?.loras.first { $0.file == l.file }?.mode ?? .all)
+        }
         cfg.controls = controlConfigs
         if let up = params.upscaler { cfg.upscaler = up; cfg.upscalerScaleFactor = upscaleFactor }
+        else { cfg.upscaler = nil }
         if let n = params.numFrames { cfg.numFrames = Int32(n) }
+        if let s = params.shiftForAudio { cfg.shiftForAudio = Float(s) }
+        if initCG == nil { cfg.strength = 1.0 }
         if initCG != nil {
             cfg.strength = Float(strength)
             // Dedicated inpainting checkpoints need the inpaint control enabled.
