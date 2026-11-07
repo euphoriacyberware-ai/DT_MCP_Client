@@ -19,7 +19,7 @@ public struct Guardrails: Codable, Sendable, Equatable {
     public var maxPixels: Int = 2048 * 2048
     public var maxSteps: Int = 80
     public var maxBatchCount: Int = 8
-    public var maxFrames: Int = 129
+    public var maxFrames: Int = 362
     public init() {}
 
     public enum Violation: Error, LocalizedError {
