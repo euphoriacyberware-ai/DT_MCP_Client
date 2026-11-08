@@ -34,6 +34,8 @@ public enum VideoOutput {
         public var lastFrame: String?
         /// Folder with every frame as PNG plus a manifest, when requested.
         public var framesFolder: String?
+        /// What upscaling / interpolation actually ran, when any was requested.
+        public var processingNote: String?
     }
 
     /// Writes the frames (and the model's audio, if any) to an MP4 and returns its path plus the
@@ -41,20 +43,63 @@ public enum VideoOutput {
     /// Optionally also keeps the exact last frame (for chaining clips) and every frame as a folder.
     public static func write(
         frames: [CGImage], frameRate: Int, audio: GeneratedAudio?, jobID: String, into folder: URL,
-        saveLastFrame: Bool = false, saveFrames: Bool = false
+        saveLastFrame: Bool = false, saveFrames: Bool = false,
+        process: VideoProcessOptions = VideoProcessOptions(),
+        preferredUpscale: SuperResolutionMethod? = nil,
+        preferredInterpolation: InterpolationMethod? = nil
     ) async throws -> Written {
+        for (name, v) in [("upscale_factor", process.upscale), ("interpolate_factor", process.interpolate)] {
+            if let v, !VideoProcessing.factors.contains(v) { throw VideoProcessError.badFactor(name, v) }
+        }
+        if let fr = process.frameRate, !(1...240).contains(fr) {
+            throw VideoProcessError.badFactor("frame_rate (1-240)", fr)
+        }
         guard frames.count > 1 else { throw VideoOutputError.noVideoReturned(frames.count) }
         let videoName = OutputManager.fileName(jobID: jobID, index: 0, ext: "mp4")
         let videoURL = folder.appendingPathComponent(videoName)
         let posterURL = folder.appendingPathComponent(OutputManager.fileName(jobID: jobID, index: 0, ext: "png"))
         let stem = (videoName as NSString).deletingPathExtension
         let wav = audio?.wavData()
-        let config = VideoConfiguration(
+        // Upscaling and interpolation run on the raw frames in the same pass that encodes the MP4,
+        // so the video is compressed once. Interpolation keeps the duration unless frame_rate is given.
+        var config = VideoConfiguration(
             outputURL: videoURL, sourceFrameRate: frameRate, frameRate: frameRate, audioData: wav)
-        _ = try await VideoAssembler().assemble(
-            frames: VideoFrameCollection(cgImages: frames), configuration: config)
+        let f = process.interpolate ?? 1
+        var audioNote = ""
+        if f > 1 {
+            config.frameRate = process.frameRate ?? frameRate * f
+            config.interpolation = .enabled(factor: f)
+        } else if let fr = process.frameRate {
+            config.sourceFrameRate = fr
+            config.frameRate = fr
+        }
+        let durationKept = f > 1 ? config.frameRate == frameRate * f : config.sourceFrameRate == frameRate
+        if !durationKept, wav != nil {
+            config.audioData = nil
+            audioNote = "; audio dropped because the speed changed"
+        }
+        if let u = process.upscale { config.superResolution = .enabled(factor: u) }
+        config.interpolationMethod = preferredInterpolation
+        config.superResolutionMethod = preferredUpscale
+        var engines: [String] = []
+        if let u = process.upscale {
+            let m = await SuperResolutionScaler(preferredMethod: preferredUpscale).activeMethod
+            engines.append("upscaled \(u)x (\(m.rawValue))")
+            if let first = frames.first, m != .coreImageLanczos, first.width > 1920 || first.height > 1080 {
+                engines[engines.count - 1] += ", frames over 1920x1080 are resized without ML"
+            }
+        }
+        if f > 1 {
+            let m = await FrameInterpolator(preferredMethod: preferredInterpolation).activeMethod
+            engines.append("interpolated \(f)x (\(m.rawValue))")
+        }
+        _ = try await VideoAssembler(
+            preferredInterpolationMethod: preferredInterpolation,
+            preferredSuperResolutionMethod: preferredUpscale
+        ).assemble(frames: VideoFrameCollection(cgImages: frames), configuration: config)
         try ImageHelpers.saveImage(frames[0], to: posterURL, format: .png)
         var result = Written(video: videoURL.path, poster: posterURL.path)
+        if !engines.isEmpty { result.processingNote = engines.joined(separator: ", ") + audioNote }
         if saveLastFrame, let last = frames.last {
             let url = folder.appendingPathComponent("\(stem)_last.png")
             try ImageHelpers.saveImage(last, to: url, format: .png)

@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import DrawThingsClient
 import MCP
 import Testing
@@ -462,6 +463,37 @@ import DrawThingsVideoKit
             preferredUpscale: .coreImageLanczos, preferredInterpolation: .coreImageDissolve
         ) { _, _ in }
         return (out, note)
+    }
+
+    @Test func generationTimeProcessingUsesRawFrames() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = (0..<6).map { i in
+            ImageInputTests.image(128, 96, left: (UInt8(i * 30), 40, 80, 255), right: (200, UInt8(i * 10), 0, 255))
+        }
+        let w = try await VideoOutput.write(
+            frames: frames, frameRate: 16, audio: nil, jobID: "job1", into: dir, saveLastFrame: true,
+            process: VideoProcessOptions(upscale: 2, interpolate: 2),
+            preferredUpscale: .coreImageLanczos, preferredInterpolation: .coreImageDissolve)
+        let info = try await VideoFrames.info(of: URL(fileURLWithPath: w.video))
+        #expect(info.width == 256 && info.height == 192)
+        #expect(info.frameCount == (6 - 1) * 2 + 1)
+        #expect(abs(info.duration - 6.0 / 16.0) < 0.15)
+        #expect(w.processingNote?.contains("upscaled 2x") == true && w.processingNote?.contains("interpolated 2x") == true)
+        // The still images stay at the generated size.
+        let last = try #require(w.lastFrame)
+        let src = try #require(CGImageSourceCreateWithURL(URL(fileURLWithPath: last) as CFURL, nil))
+        let img = try #require(CGImageSourceCreateImageAtIndex(src, 0, nil))
+        #expect(img.width == 128 && img.height == 96)
+    }
+
+    @Test func generationTimeProcessingRejectsBadFactor() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = (0..<3).map { _ in ImageInputTests.image(32, 32, left: (1, 2, 3, 255), right: (4, 5, 6, 255)) }
+        await #expect(throws: VideoProcessError.self) {
+            _ = try await VideoOutput.write(
+                frames: frames, frameRate: 16, audio: nil, jobID: "j", into: dir,
+                process: VideoProcessOptions(upscale: 9))
+        }
     }
 
     @Test func extractsFirstLastAndIndices() async throws {

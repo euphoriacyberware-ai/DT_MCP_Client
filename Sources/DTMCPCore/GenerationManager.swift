@@ -41,6 +41,8 @@ public struct ImageJobParams: Sendable {
     public var saveLastFrame = false
     /// Video only: also save every frame as PNG in a folder with a manifest.
     public var saveFrames = false
+    /// Video only: upscale / interpolate / re-time the raw frames while the MP4 is encoded.
+    public var postProcess = VideoProcessOptions()
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -227,6 +229,18 @@ public actor GenerationManager {
             if let n = params.numFrames, n > guardrails.maxFrames {
                 throw VideoOutputError.tooManyFrames(n, guardrails.maxFrames)
             }
+            let pp = params.postProcess
+            for (name, v) in [("upscale_factor", pp.upscale), ("interpolate_factor", pp.interpolate)] {
+                if let v, !VideoProcessing.factors.contains(v) { throw VideoProcessError.badFactor(name, v) }
+            }
+            if pp.upscale != nil || pp.interpolate != nil, let n = params.numFrames {
+                let need = VideoProcessing.estimateMemoryMB(
+                    frames: n, width: params.width, height: params.height,
+                    upscale: pp.upscale ?? 1, interpolate: pp.interpolate ?? 1)
+                if need > guardrails.maxProcessingMemoryMB {
+                    throw VideoProcessError.tooMuchMemory(need, guardrails.maxProcessingMemoryMB)
+                }
+            }
             let version = (try? await catalog())?.checkpoint(file: params.model)?.version
             if VideoOutput.isKnownImageModel(params.model, version: version) {
                 throw VideoOutputError.notAVideoModel(params.model)
@@ -294,7 +308,7 @@ public actor GenerationManager {
         let previous = tail
         let jobs = self.jobs
         let jobID = job.id
-        let saveLast = params.saveLastFrame, saveAll = params.saveFrames
+        let saveLast = params.saveLastFrame, saveAll = params.saveFrames, post = params.postProcess
         let task = Task {
             await previous?.value
             if Task.isCancelled { return }
@@ -316,7 +330,7 @@ public actor GenerationManager {
                     let out = try await VideoOutput.write(
                         frames: result.images, frameRate: fps, audio: result.audio.first,
                         jobID: jobID, into: outDir,
-                        saveLastFrame: saveLast, saveFrames: saveAll)
+                        saveLastFrame: saveLast, saveFrames: saveAll, process: post)
                     var outs = [out.video, out.poster]
                     var labels = ["video.mp4", "first_frame.png"]
                     if let l = out.lastFrame { outs.append(l); labels.append("last_frame.png") }
@@ -324,7 +338,9 @@ public actor GenerationManager {
                     paths = outs
                     let frameCount = result.images.count
                     await jobs.update(jobID) {
-                        $0.note = "\($0.note ?? ""), \(frameCount) frames at \(fps) fps; outputs are [\(labels.joined(separator: ", "))]"
+                        $0.note = "\($0.note ?? ""), \(frameCount) frames at \(fps) fps"
+                            + (out.processingNote.map { "; \($0)" } ?? "")
+                            + "; outputs are [\(labels.joined(separator: ", "))]"
                     }
                 } else {
                     paths = try OutputManager.writeImages(result.images, jobID: jobID, into: outDir)

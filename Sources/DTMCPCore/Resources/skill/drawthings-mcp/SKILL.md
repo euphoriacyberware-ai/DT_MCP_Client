@@ -96,6 +96,7 @@ generate_video { prompt, model, num_frames, width, height }   // optional init_i
 ```
 - You need a **video model** (names like Wan, LTX, Hunyuan). Search with `list_models` and `query`. If none is installed, tell the user; image models are rejected.
 - Clip length is `num_frames` divided by the model's frame rate. Typical counts are 33, 49 or 81. Longer clips take much longer and may exceed the user's limit.
+- Want a bigger or smoother video? Ask for it here, not afterwards: add `upscale_factor` (2-4) and/or `interpolate_factor` (2-4), and optionally `frame_rate`. They work on the raw frames before the .mp4 is made, so the result is better than `process_video` on a finished file. The `first_frame.png` and `last_frame.png` stay at the generated size. The `note` names the engine used (see "Smooth motion, slow motion, upscale a video" for what the factors mean).
 - `outputs` is `[the .mp4, the first frame as .png]`, plus `last_frame.png` if you set `save_last_frame`, plus a frames folder if you set `save_frames`. The `note` lists them in order. Use the PNG to check the first frame quickly.
 - Video can take many minutes. Keep calling `wait_for_job` with `timeout_seconds` 300 until it finishes.
 - Video does not support `mask_image`, `controls` or `batch_count`.
@@ -128,6 +129,7 @@ extract_frames { video, frames: "first" | "last" | "all" | 12 | [0, 40, 80] }
 - Files go to the output folder and the result lists the paths.
 
 ### Smooth motion, slow motion, upscale a video
+For a new clip, put `upscale_factor` / `interpolate_factor` / `frame_rate` on `generate_video` (best quality, one compression step). Use `process_video` for a clip that already exists.
 ```
 process_video { source: "/abs/clip.mp4", interpolate_factor: 2 }          // smoother, same length
 process_video { source: "/abs/clip.mp4", interpolate_factor: 2, frame_rate: 24 }   // slow motion (see below)

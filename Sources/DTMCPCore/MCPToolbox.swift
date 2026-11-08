@@ -132,6 +132,9 @@ public struct MCPToolbox: Sendable {
                     "config_json": Self.configJSONProp,
                     "save_last_frame": prop("boolean", "Also save the exact last frame as last_frame.png. Use it when you will continue the story with another clip (pass it as init_image). Default false."),
                     "save_frames": prop("boolean", "Also save every frame as PNG in a folder (lossless), for process_video or extract_frames. Large; default false."),
+                    "upscale_factor": prop("integer", "Make the video 2, 3 or 4 times larger. Done on the raw frames before the MP4 is made, so it looks better than process_video on a finished file. first_frame.png and last_frame.png stay at the generated size."),
+                    "interpolate_factor": prop("integer", "Insert frames for smoother motion: 2, 3 or 4. The clip keeps its length and the frame rate rises by the factor."),
+                    "frame_rate": prop("integer", "Frames per second of the MP4. With interpolate_factor it overrides the automatic rate (changes the speed). Alone it changes the speed. Omit to keep the model's rate."),
                 ]),
                 "required": .array([.string("prompt"), .string("model"), .string("num_frames")]),
             ]),
@@ -330,6 +333,11 @@ public struct MCPToolbox: Sendable {
         p.numFrames = numFrames
         p.saveLastFrame = a["save_last_frame"]?.boolValue ?? false
         p.saveFrames = a["save_frames"]?.boolValue ?? false
+        if numFrames != nil {
+            p.postProcess = VideoProcessOptions(
+                upscale: a["upscale_factor"]?.intValue, interpolate: a["interpolate_factor"]?.intValue,
+                frameRate: a["frame_rate"]?.intValue)
+        }
         p.negativePrompt = a["negative_prompt"]?.stringValue ?? ""
         p.shiftForAudio = a["shift_for_audio"]?.doubleValue ?? (configGiven ? Double(base.shiftForAudio) : nil)
         if configGiven {
