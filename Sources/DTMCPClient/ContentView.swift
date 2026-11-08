@@ -53,6 +53,7 @@ private struct ConnectionTab: View {
                 TextField("Max steps", value: $m.guardrails.maxSteps, format: .number)
                 TextField("Max batch count", value: $m.guardrails.maxBatchCount, format: .number)
                 TextField("Max video frames", value: $m.guardrails.maxFrames, format: .number)
+                TextField("Max video processing memory (MB)", value: $m.guardrails.maxProcessingMemoryMB, format: .number.grouping(.never))
                 TextField("Max pixels", value: $m.guardrails.maxPixels, format: .number.grouping(.never))
             }
         }

@@ -130,10 +130,54 @@ public struct MCPToolbox: Sendable {
                     "loras": Self.lorasProp,
                     "shift_for_audio": Self.shiftForAudioProp,
                     "config_json": Self.configJSONProp,
+                    "save_last_frame": prop("boolean", "Also save the exact last frame as last_frame.png. Use it when you will continue the story with another clip (pass it as init_image). Default false."),
+                    "save_frames": prop("boolean", "Also save every frame as PNG in a folder (lossless), for process_video or extract_frames. Large; default false."),
                 ]),
                 "required": .array([.string("prompt"), .string("model"), .string("num_frames")]),
             ]),
             annotations: .init(title: "Generate video", readOnlyHint: false, openWorldHint: false)),
+        Tool(
+            name: "extract_frames",
+            description: """
+                Save frames of an existing .mp4 as PNG files. frames is "first", "last", "all", or a \
+                frame number or list of numbers (counted from 0, at most 64). "last" gives the picture \
+                to continue from when chaining clips (pass it to generate_video as init_image). "all" \
+                writes a folder of PNGs that process_video can turn back into a video. Returns the file \
+                paths. The video must be in a folder the user granted; files go to the output folder.
+                """,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "video": prop("string", "Absolute path of the .mp4."),
+                    "frames": .object([
+                        "description": .string("\"first\", \"last\", \"all\", a frame number, or an array of frame numbers."),
+                    ]),
+                ]),
+                "required": .array([.string("video"), .string("frames")]),
+            ]),
+            annotations: .init(title: "Extract frames", readOnlyHint: false, openWorldHint: false)),
+        Tool(
+            name: "process_video",
+            description: """
+                Make a new video from an existing .mp4 or a frames folder (from extract_frames or \
+                save_frames): upscale it (upscale_factor 2-4), smooth it or make slow motion by \
+                inserting frames (interpolate_factor 2-4), or change its frame rate. The original is \
+                kept. Returns a job_id: use wait_for_job. These run on the user's Mac, not the Draw \
+                Things server, and are slow on long clips. The job note says which engine ran: Apple's \
+                ML, or a plain resize / cross-fade fallback.
+                """,
+            inputSchema: .object([
+                "type": "object",
+                "properties": .object([
+                    "source": prop("string", "Absolute path of an .mp4 or a frames folder, inside a folder the user granted."),
+                    "upscale_factor": prop("integer", "Make each frame 2, 3 or 4 times larger in each direction."),
+                    "interpolate_factor": prop("integer", "Insert frames to make motion smoother: 2, 3 or 4. The clip keeps its length and its frame rate rises by the factor."),
+                    "frame_rate": prop("integer", "Frames per second for the result. With interpolate_factor it overrides the automatic rate (changes the speed). Alone, it changes the speed of the clip. Needed for a frames folder without a recorded rate."),
+                    "keep_audio": prop("boolean", "Keep the audio track when the length is unchanged. Default true."),
+                ]),
+                "required": .array([.string("source")]),
+            ]),
+            annotations: .init(title: "Process video", readOnlyHint: false, openWorldHint: false)),
         Tool(
             name: "get_job",
             description: "Get the status, progress and output file paths of a job.",
@@ -210,6 +254,18 @@ public struct MCPToolbox: Sendable {
                 a.removeValue(forKey: "upscaler")
                 if a["controls"] != nil { throw ToolError("controls are not supported for generate_video.") }
                 return json(try await generateImage(a, numFrames: n))
+            case "extract_frames":
+                let video = try requireString(args, "video")
+                let sel = try Self.parseSelection(args?["frames"])
+                return json(try await manager.extractFrames(video: video, selection: sel))
+            case "process_video":
+                let source = try requireString(args, "source")
+                var o = VideoProcessOptions()
+                o.upscale = args?["upscale_factor"]?.intValue
+                o.interpolate = args?["interpolate_factor"]?.intValue
+                o.frameRate = args?["frame_rate"]?.intValue
+                o.keepAudio = args?["keep_audio"]?.boolValue ?? true
+                return json(try await manager.submitVideoProcessing(source: source, options: o))
             case "get_job":
                 let id = try requireString(args, "job_id")
                 guard let job = await manager.jobs.get(id) else { throw ToolError("Unknown job_id '\(id)'.") }
@@ -272,6 +328,8 @@ public struct MCPToolbox: Sendable {
             shift: a["shift"]?.doubleValue ?? Double(base.shift),
             sampler: samplerArg ?? SamplerNames.name(of: base.sampler))
         p.numFrames = numFrames
+        p.saveLastFrame = a["save_last_frame"]?.boolValue ?? false
+        p.saveFrames = a["save_frames"]?.boolValue ?? false
         p.negativePrompt = a["negative_prompt"]?.stringValue ?? ""
         p.shiftForAudio = a["shift_for_audio"]?.doubleValue ?? (configGiven ? Double(base.shiftForAudio) : nil)
         if configGiven {
@@ -335,6 +393,24 @@ public struct MCPToolbox: Sendable {
     }
 
     // MARK: Helpers
+
+    static func parseSelection(_ v: Value?) throws -> FrameSelection {
+        if let n = v?.intValue { return .indices([n]) }
+        if let t = v?.stringValue?.lowercased() {
+            switch t {
+            case "first": return .first
+            case "last": return .last
+            case "all": return .all
+            default:
+                if let n = Int(t) { return .indices([n]) }
+            }
+        }
+        if let arr = v?.arrayValue {
+            let nums = arr.compactMap(\.intValue)
+            if !nums.isEmpty, nums.count == arr.count { return .indices(nums) }
+        }
+        throw ToolError("'frames' must be \"first\", \"last\", \"all\", a frame number, or a list of frame numbers.")
+    }
 
     static let lorasProp: Value = .object([
         "type": "array",

@@ -29,6 +29,8 @@ Statuses: `queued`, `running`, `completed`, `failed`, `cancelled`. A `failed` jo
 | `get_model_recommendations` | Get size and settings for a model. |
 | `generate_image` | Text-to-image, img2img, inpaint, ControlNet, optional upscaling. |
 | `generate_video` | Video from text, or from a start image. |
+| `extract_frames` | Save the first, last or any frames of an existing .mp4 as PNG files. |
+| `process_video` | Make a new video from an .mp4 or frames folder: upscale, smoother motion or slow motion, change frame rate. |
 | `wait_for_job` / `get_job` / `list_jobs` | Follow jobs. Prefer `wait_for_job`. |
 | `cancel_job` | Stop a queued or running job. |
 
@@ -94,7 +96,7 @@ generate_video { prompt, model, num_frames, width, height }   // optional init_i
 ```
 - You need a **video model** (names like Wan, LTX, Hunyuan). Search with `list_models` and `query`. If none is installed, tell the user; image models are rejected.
 - Clip length is `num_frames` divided by the model's frame rate. Typical counts are 33, 49 or 81. Longer clips take much longer and may exceed the user's limit.
-- `outputs` is `[the .mp4, the first frame as .png]`. Use the PNG to check the first frame quickly.
+- `outputs` is `[the .mp4, the first frame as .png]`, plus `last_frame.png` if you set `save_last_frame`, plus a frames folder if you set `save_frames`. The `note` lists them in order. Use the PNG to check the first frame quickly.
 - Video can take many minutes. Keep calling `wait_for_job` with `timeout_seconds` 300 until it finishes.
 - Video does not support `mask_image`, `controls` or `batch_count`.
 - `generate_video` accepts `loras` (for example a speed-up LoRA), and `shift_for_audio` for audio-capable models.
@@ -109,6 +111,36 @@ generate_video { prompt, num_frames, config_json: "<the JSON>" }
 - The user's configuration is deliberate for that model. Do not "correct" its sampler, steps, guidance or shift, and do not drop its LoRAs.
 - If the call is rejected for the frame count, tell the user the limit is set in the app's Guardrails.
 
+### Chain clips (continue a story)
+```
+generate_video { prompt: "scene 1", model, num_frames, save_last_frame: true }
+generate_video { prompt: "what happens next", model, num_frames, init_image: "<last_frame.png from clip 1>" }
+```
+- Ask for `save_last_frame` on every clip you may continue. It is the exact picture, with no video compression.
+- For a clip that already exists, call `extract_frames { video: "/abs/clip.mp4", frames: "last" }`.
+- Keep the same model, size and seed settings so the clips match. Each clip is a separate file; there is no tool to join them, so tell the user the order.
+
+### Work with frames
+```
+extract_frames { video, frames: "first" | "last" | "all" | 12 | [0, 40, 80] }
+```
+- Frame numbers start at 0. A list can hold up to 64 numbers. `"all"` writes a folder of PNGs (no audio) that you can pass to `process_video` as `source`.
+- Files go to the output folder and the result lists the paths.
+
+### Smooth motion, slow motion, upscale a video
+```
+process_video { source: "/abs/clip.mp4", interpolate_factor: 2 }          // smoother, same length
+process_video { source: "/abs/clip.mp4", interpolate_factor: 2, frame_rate: 24 }   // slow motion (see below)
+process_video { source: "/abs/clip.mp4", upscale_factor: 2 }              // bigger frames
+```
+- It returns a job. Use `wait_for_job` (long timeout) and read `outputs` for the new .mp4. The original is kept.
+- `interpolate_factor` (2, 3 or 4) adds frames between the existing ones. The clip keeps its length and audio, and the frame rate rises by the factor. If you also pass `frame_rate`, the speed changes: for slow motion, pick a rate lower than source rate times the factor.
+- `frame_rate` on its own speeds up or slows down the clip. Audio is dropped when the speed changes (the note says so). Pass `keep_audio: false` to drop it yourself.
+- `upscale_factor` (2, 3 or 4) makes each side larger. Apple's ML upscaler runs only on newer macOS and for frames up to 1920x1080; otherwise a plain resize happens. **Read the job `note`**: it names the engine used. Do not promise added detail when it says `coreImageLanczos`.
+- Both run on the user's Mac and are slow on long or large clips. If the call says it needs too much memory, lower the factor, or tell the user.
+- Do one thing at a time if unsure: first interpolate, check the result, then upscale the output.
+- To start from frames, pass the folder from `extract_frames` or `save_frames` as `source`. With no options, it rebuilds the .mp4.
+
 ## When something goes wrong
 
 | Message or symptom | What to do |
@@ -121,6 +153,8 @@ generate_video { prompt, num_frames, config_json: "<the JSON>" }
 | "The server returned no image" | The sampler, steps, guidance or shift do not suit the model. Call `get_model_recommendations`, use its values, or ask the user for the model's recommended settings. Do not retry the same settings. |
 | "is not installed" or "different model family" | Call the matching list tool with `compatible_with` and choose from the result. |
 | List is empty, or the model/LoRA you were asked to use is not in it | The server's list may be incomplete or "Enable Model Browsing" may be off. Try once without `query`. If the user gave the exact file name, use it as written. If they only described it, ask for the file name. Do not substitute another model or guess its settings. |
+| "needs about N MB of memory" | Use a smaller `upscale_factor` or `interpolate_factor`, or process a shorter clip. Do not retry the same request. |
+| "has no video track" / "neither a video file nor a frames folder" | `source` or `video` must be an .mp4 (or, for `process_video`, a frames folder). Check the path with `list_jobs` outputs. |
 | Job `cancelled` | Someone cancelled it. Ask before starting it again. |
 
 If a tool returns `isError`, read its message: it tells you what to change. Make one corrected attempt, then report to the user instead of looping.

@@ -27,20 +27,47 @@ public enum VideoOutput {
         return family != .unknown && family.nativeFrameRate == nil
     }
 
+    public struct Written: Sendable {
+        public var video: String
+        public var poster: String
+        /// Exact last frame as PNG, when requested.
+        public var lastFrame: String?
+        /// Folder with every frame as PNG plus a manifest, when requested.
+        public var framesFolder: String?
+    }
+
     /// Writes the frames (and the model's audio, if any) to an MP4 and returns its path plus the
     /// path of the first frame as a PNG poster, which lets a vision model check the result cheaply.
+    /// Optionally also keeps the exact last frame (for chaining clips) and every frame as a folder.
     public static func write(
-        frames: [CGImage], frameRate: Int, audio: GeneratedAudio?, jobID: String, into folder: URL
-    ) async throws -> (video: String, poster: String) {
+        frames: [CGImage], frameRate: Int, audio: GeneratedAudio?, jobID: String, into folder: URL,
+        saveLastFrame: Bool = false, saveFrames: Bool = false
+    ) async throws -> Written {
         guard frames.count > 1 else { throw VideoOutputError.noVideoReturned(frames.count) }
-        let videoURL = folder.appendingPathComponent(OutputManager.fileName(jobID: jobID, index: 0, ext: "mp4"))
+        let videoName = OutputManager.fileName(jobID: jobID, index: 0, ext: "mp4")
+        let videoURL = folder.appendingPathComponent(videoName)
         let posterURL = folder.appendingPathComponent(OutputManager.fileName(jobID: jobID, index: 0, ext: "png"))
+        let stem = (videoName as NSString).deletingPathExtension
+        let wav = audio?.wavData()
         let config = VideoConfiguration(
-            outputURL: videoURL, sourceFrameRate: frameRate, frameRate: frameRate,
-            audioData: audio?.wavData())
+            outputURL: videoURL, sourceFrameRate: frameRate, frameRate: frameRate, audioData: wav)
         _ = try await VideoAssembler().assemble(
             frames: VideoFrameCollection(cgImages: frames), configuration: config)
         try ImageHelpers.saveImage(frames[0], to: posterURL, format: .png)
-        return (videoURL.path, posterURL.path)
+        var result = Written(video: videoURL.path, poster: posterURL.path)
+        if saveLastFrame, let last = frames.last {
+            let url = folder.appendingPathComponent("\(stem)_last.png")
+            try ImageHelpers.saveImage(last, to: url, format: .png)
+            result.lastFrame = url.path
+        }
+        if saveFrames {
+            let dir = folder.appendingPathComponent("\(stem)_frames", isDirectory: true)
+            var collection = VideoFrameCollection(
+                cgImages: frames, metadata: VideoFrameMetadata(custom: ["frameRate": String(frameRate)]))
+            if let wav { collection.audioData = [wav] }
+            try await collection.save(to: dir, format: .png)
+            result.framesFolder = dir.path
+        }
+        return result
     }
 }
