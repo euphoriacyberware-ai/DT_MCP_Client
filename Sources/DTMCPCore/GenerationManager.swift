@@ -1,5 +1,6 @@
 import CoreGraphics
 import DrawThingsClient
+import DrawThingsVideoKit
 import Foundation
 
 /// Parameters of a text-to-image job as parsed from an agent's tool call.
@@ -36,6 +37,12 @@ public struct ImageJobParams: Sendable {
     /// A configuration parsed from the agent's `config_json`. Every setting this tool has no
     /// argument for (tiled decoding, TeaCache, LoRA modes, ...) is taken from here.
     public var baseConfig: DrawThingsConfiguration?
+    /// Video only: also save the exact last frame as a PNG (for chaining clips).
+    public var saveLastFrame = false
+    /// Video only: also save every frame as PNG in a folder with a manifest.
+    public var saveFrames = false
+    /// Video only: upscale / interpolate / re-time the raw frames while the MP4 is encoded.
+    public var postProcess = VideoProcessOptions()
 }
 
 public enum GenerationError: Error, LocalizedError {
@@ -222,6 +229,18 @@ public actor GenerationManager {
             if let n = params.numFrames, n > guardrails.maxFrames {
                 throw VideoOutputError.tooManyFrames(n, guardrails.maxFrames)
             }
+            let pp = params.postProcess
+            for (name, v) in [("upscale_factor", pp.upscale), ("interpolate_factor", pp.interpolate)] {
+                if let v, !VideoProcessing.factors.contains(v) { throw VideoProcessError.badFactor(name, v) }
+            }
+            if pp.upscale != nil || pp.interpolate != nil, let n = params.numFrames {
+                let need = VideoProcessing.estimateMemoryMB(
+                    frames: n, width: params.width, height: params.height,
+                    upscale: pp.upscale ?? 1, interpolate: pp.interpolate ?? 1)
+                if need > guardrails.maxProcessingMemoryMB {
+                    throw VideoProcessError.tooMuchMemory(need, guardrails.maxProcessingMemoryMB)
+                }
+            }
             let version = (try? await catalog())?.checkpoint(file: params.model)?.version
             if VideoOutput.isKnownImageModel(params.model, version: version) {
                 throw VideoOutputError.notAVideoModel(params.model)
@@ -289,6 +308,7 @@ public actor GenerationManager {
         let previous = tail
         let jobs = self.jobs
         let jobID = job.id
+        let saveLast = params.saveLastFrame, saveAll = params.saveFrames, post = params.postProcess
         let task = Task {
             await previous?.value
             if Task.isCancelled { return }
@@ -309,10 +329,18 @@ public actor GenerationManager {
                     let fps = result.media.frameRate ?? 16
                     let out = try await VideoOutput.write(
                         frames: result.images, frameRate: fps, audio: result.audio.first,
-                        jobID: jobID, into: outDir)
-                    paths = [out.video, out.poster]
+                        jobID: jobID, into: outDir,
+                        saveLastFrame: saveLast, saveFrames: saveAll, process: post)
+                    var outs = [out.video, out.poster]
+                    var labels = ["video.mp4", "first_frame.png"]
+                    if let l = out.lastFrame { outs.append(l); labels.append("last_frame.png") }
+                    if let f = out.framesFolder { outs.append(f); labels.append("frames folder") }
+                    paths = outs
+                    let frameCount = result.images.count
                     await jobs.update(jobID) {
-                        $0.note = "\($0.note ?? ""), \(result.images.count) frames at \(fps) fps; outputs are [video.mp4, first_frame.png]"
+                        $0.note = "\($0.note ?? ""), \(frameCount) frames at \(fps) fps"
+                            + (out.processingNote.map { "; \($0)" } ?? "")
+                            + "; outputs are [\(labels.joined(separator: ", "))]"
                     }
                 } else {
                     paths = try OutputManager.writeImages(result.images, jobID: jobID, into: outDir)
@@ -330,6 +358,101 @@ public actor GenerationManager {
         tail = task
         await jobs.attach(task: task, to: jobID)
         return await jobs.get(jobID) ?? job
+    }
+
+
+    // MARK: Video post-processing
+
+    /// Queues an upscale / interpolate / re-time / assemble job for a video or frames folder.
+    public func submitVideoProcessing(source: String, options: VideoProcessOptions) async throws -> Job {
+        let src = try await folders.authorizedReadURL(source)
+        let outDir = try await folders.outputFolder()
+        let job = await jobs.create(kind: "video_process", prompt: "process \(src.lastPathComponent)", model: "")
+        let output = outDir.appendingPathComponent(OutputManager.fileName(jobID: job.id, index: 0, ext: "mp4"))
+        let limit = guardrails.maxProcessingMemoryMB
+        let previous = tail
+        let jobs = self.jobs
+        let jobID = job.id
+        let task = Task {
+            await previous?.value
+            if Task.isCancelled { return }
+            await jobs.update(jobID) { $0.status = .running }
+            do {
+                let note = try await VideoProcessing.process(
+                    source: src, output: output, options: options, maxMemoryMB: limit
+                ) { stage, fraction in
+                    Task {
+                        await jobs.update(jobID) {
+                            $0.stage = stage
+                            $0.step = Int(fraction * 100)
+                            $0.totalSteps = 100
+                        }
+                    }
+                }
+                await jobs.update(jobID) { $0.outputs = [output.path]; $0.note = note; $0.status = .completed }
+            } catch is CancellationError {
+                await jobs.update(jobID) { $0.status = .cancelled }
+            } catch {
+                try? FileManager.default.removeItem(at: output)
+                await jobs.update(jobID) { $0.error = error.localizedDescription; $0.status = .failed }
+            }
+        }
+        tail = task
+        await jobs.attach(task: task, to: jobID)
+        return await jobs.get(jobID) ?? job
+    }
+
+    public struct ExtractedFrames: Codable, Sendable {
+        public var frames: [String]
+        public var framesFolder: String?
+        public var frameCount: Int
+        public var frameRate: Double
+        public var width: Int
+        public var height: Int
+        public var note: String?
+    }
+
+    /// Saves selected frames of a video as PNGs (or every frame into a folder) in the output folder.
+    public func extractFrames(video: String, selection: FrameSelection) async throws -> ExtractedFrames {
+        let src = try await folders.authorizedReadURL(video)
+        let outDir = try await folders.outputFolder()
+        let info = try await VideoFrames.info(of: src)
+        if selection == .all {
+            let need = VideoProcessing.estimateMemoryMB(
+                frames: info.frameCount, width: info.width, height: info.height, upscale: 1, interpolate: 1)
+            guard need <= guardrails.maxProcessingMemoryMB else {
+                throw VideoProcessError.tooMuchMemory(need, guardrails.maxProcessingMemoryMB)
+            }
+        }
+        let read = try await VideoFrames.read(src, selection: selection)
+        guard !read.frames.isEmpty else { throw VideoOutputError.noVideoReturned(0) }
+        let stem = OutputManager.stem(jobID: "extract_" + UUID().uuidString.prefix(6).lowercased())
+        let first = read.frames[0].image
+        var result = ExtractedFrames(
+            frames: [], framesFolder: nil, frameCount: read.total, frameRate: info.frameRate,
+            width: first.width, height: first.height, note: nil)
+        if selection == .all {
+            let dir = outDir.appendingPathComponent("\(stem)_frames", isDirectory: true)
+            let rate = String(Int(info.frameRate.rounded()))
+            let collection = VideoFrameCollection(
+                cgImages: read.frames.map(\.image), metadata: VideoFrameMetadata(custom: ["frameRate": rate]))
+            try await collection.save(to: dir, format: .png)
+            result.framesFolder = dir.path
+            result.note = "Frames folder has no audio. Pass it as 'source' to process_video."
+        } else {
+            for (i, f) in read.frames {
+                let label: String
+                switch selection {
+                case .last: label = "last"
+                case .first: label = "first"
+                default: label = "f\(i)"
+                }
+                let url = outDir.appendingPathComponent("\(stem)_\(label).png")
+                try ImageHelpers.saveImage(f, to: url, format: .png)
+                result.frames.append(url.path)
+            }
+        }
+        return result
     }
 
     static func describe(_ error: Error) -> String {

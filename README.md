@@ -18,10 +18,12 @@ A macOS app that lets AI agents generate images and video with a [Draw Things](h
 | `list_models`, `list_loras`, `list_controlnets`, `list_upscalers` | See what is installed |
 | `get_model_recommendations` | Size, sampler, steps, guidance and shift for a model |
 | `generate_image` | Text-to-image, img2img, inpaint, ControlNet, LoRAs, upscaling |
-| `generate_video` | Video from text or a start image |
+| `generate_video` | Video from text or a start image; optionally upscales or interpolates the raw frames before encoding, keeps the last frame (to chain clips) and every frame |
+| `extract_frames` | Save the first, last or any frames of an .mp4 as PNGs |
+| `process_video` | Upscale, interpolate (smoother or slow motion) or re-time an existing video; runs locally on the Mac |
 | `wait_for_job`, `get_job`, `list_jobs`, `cancel_job` | Follow and control jobs |
 
-Generation is asynchronous: `generate_*` returns a `job_id`, and `wait_for_job` returns the output file paths.
+Generation is asynchronous: `generate_*` and `process_video` return a `job_id`, and `wait_for_job` returns the output file paths. Video upscaling and interpolation use Apple's on-device ML on recent macOS and fall back to a plain resize or cross-fade on older systems; the job note says which ran.
 
 ## Setup
 

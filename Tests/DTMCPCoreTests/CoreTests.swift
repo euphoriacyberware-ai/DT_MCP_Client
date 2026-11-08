@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import DrawThingsClient
 import MCP
 import Testing
@@ -347,6 +348,13 @@ import AVFoundation
         for arg in ["loras", "shift_for_audio", "config_json"] {
             #expect(props(image).contains(arg) && text.contains(arg), "\(arg)")
         }
+        for arg in ["save_last_frame", "save_frames"] { #expect(props(video).contains(arg) && text.contains(arg), "\(arg)") }
+        let process = MCPToolbox.tools.first { $0.name == "process_video" }!
+        let extract = MCPToolbox.tools.first { $0.name == "extract_frames" }!
+        for arg in ["source", "upscale_factor", "interpolate_factor", "frame_rate", "keep_audio"] {
+            #expect(props(process).contains(arg) && text.contains(arg), "\(arg)")
+        }
+        for arg in ["video", "frames"] { #expect(props(extract).contains(arg), "\(arg)") }
     }
 
     @Test func exportsAndReplaces() throws {
@@ -408,5 +416,209 @@ import AVFoundation
     @Test func rejectsUnknownSamplerNumber() {
         var base = DrawThingsConfiguration()
         #expect(throws: (any Error).self) { try base.mergeJSON(#"{"sampler": 99}"#) }
+    }
+}
+
+// MARK: - Video post-processing
+
+import DrawThingsVideoKit
+
+@Suite struct VideoProcessingTests {
+    static func tempDir() throws -> URL {
+        let d = FileManager.default.temporaryDirectory.appendingPathComponent("dtmcp-vp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    /// 16-bit mono 8 kHz WAV of a quiet tone.
+    static func wav(seconds: Double) -> Data {
+        let rate = 8000, n = Int(seconds * Double(rate))
+        var d = Data()
+        func u32(_ v: Int) { var x = UInt32(v).littleEndian; d.append(Data(bytes: &x, count: 4)) }
+        func u16(_ v: Int) { var x = UInt16(v).littleEndian; d.append(Data(bytes: &x, count: 2)) }
+        d.append("RIFF".data(using: .ascii)!); u32(36 + n * 2); d.append("WAVEfmt ".data(using: .ascii)!)
+        u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
+        d.append("data".data(using: .ascii)!); u32(n * 2)
+        for i in 0..<n { u16(Int(UInt16(bitPattern: Int16(2000 * sin(Double(i) * 0.1))))) }
+        return d
+    }
+
+    /// A real MP4 of `count` frames whose colour changes frame to frame.
+    static func makeVideo(in dir: URL, count: Int = 12, fps: Int = 16, audio: Bool = false) async throws -> URL {
+        let url = dir.appendingPathComponent("src-\(UUID().uuidString.prefix(4)).mp4")
+        let frames = (0..<count).map { i in
+            ImageInputTests.image(128, 96, left: (UInt8(i * 20), 40, 80, 255), right: (200, UInt8(i * 10), 0, 255))
+        }
+        let cfg = VideoConfiguration(
+            outputURL: url, sourceFrameRate: fps, frameRate: fps,
+            audioData: audio ? wav(seconds: Double(count) / Double(fps)) : nil)
+        _ = try await VideoAssembler().assemble(frames: VideoFrameCollection(cgImages: frames), configuration: cfg)
+        return url
+    }
+
+    static func process(_ src: URL, _ opts: VideoProcessOptions, limit: Int = 4096) async throws -> (URL, String) {
+        let out = src.deletingLastPathComponent().appendingPathComponent("out-\(UUID().uuidString.prefix(4)).mp4")
+        let note = try await VideoProcessing.process(
+            source: src, output: out, options: opts, maxMemoryMB: limit,
+            preferredUpscale: .coreImageLanczos, preferredInterpolation: .coreImageDissolve
+        ) { _, _ in }
+        return (out, note)
+    }
+
+    @Test func generationTimeProcessingUsesRawFrames() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = (0..<6).map { i in
+            ImageInputTests.image(128, 96, left: (UInt8(i * 30), 40, 80, 255), right: (200, UInt8(i * 10), 0, 255))
+        }
+        let w = try await VideoOutput.write(
+            frames: frames, frameRate: 16, audio: nil, jobID: "job1", into: dir, saveLastFrame: true,
+            process: VideoProcessOptions(upscale: 2, interpolate: 2),
+            preferredUpscale: .coreImageLanczos, preferredInterpolation: .coreImageDissolve)
+        let info = try await VideoFrames.info(of: URL(fileURLWithPath: w.video))
+        #expect(info.width == 256 && info.height == 192)
+        #expect(info.frameCount == (6 - 1) * 2 + 1)
+        #expect(abs(info.duration - 6.0 / 16.0) < 0.15)
+        #expect(w.processingNote?.contains("upscaled 2x") == true && w.processingNote?.contains("interpolated 2x") == true)
+        // The still images stay at the generated size.
+        let last = try #require(w.lastFrame)
+        let src = try #require(CGImageSourceCreateWithURL(URL(fileURLWithPath: last) as CFURL, nil))
+        let img = try #require(CGImageSourceCreateImageAtIndex(src, 0, nil))
+        #expect(img.width == 128 && img.height == 96)
+    }
+
+    @Test func generationTimeProcessingRejectsBadFactor() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = (0..<3).map { _ in ImageInputTests.image(32, 32, left: (1, 2, 3, 255), right: (4, 5, 6, 255)) }
+        await #expect(throws: VideoProcessError.self) {
+            _ = try await VideoOutput.write(
+                frames: frames, frameRate: 16, audio: nil, jobID: "j", into: dir,
+                process: VideoProcessOptions(upscale: 9))
+        }
+    }
+
+    @Test func extractsFirstLastAndIndices() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        let first = try await VideoFrames.read(v, selection: .first)
+        #expect(first.frames.count == 1 && first.frames[0].index == 0 && first.total == 12)
+        let last = try await VideoFrames.read(v, selection: .last)
+        #expect(last.frames.count == 1 && last.frames[0].index == 11)
+        let some = try await VideoFrames.read(v, selection: .indices([5, 3]))
+        #expect(some.frames.map(\.index) == [3, 5])
+        let all = try await VideoFrames.read(v, selection: .all)
+        #expect(all.frames.count == 12)
+        #expect(all.frames[0].image.width == 128 && all.frames[0].image.height == 96)
+    }
+
+    @Test func outOfRangeFrameIsReported() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        await #expect(throws: VideoFramesError.self) { _ = try await VideoFrames.read(v, selection: .indices([99])) }
+    }
+
+    @Test func interpolationKeepsDurationAndAddsFrames() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        let (out, note) = try await Self.process(v, VideoProcessOptions(interpolate: 2))
+        let after = try await VideoFrames.read(out, selection: .all)
+        #expect(after.total == 23)  // (12 - 1) * 2 + 1
+        let info = try await VideoFrames.info(of: out)
+        #expect(abs(info.duration - 12.0 / 16.0) < 0.15)
+        #expect(note.contains("interpolated 2x") && note.contains("coreImageDissolve"))
+    }
+
+    @Test func upscaleDoublesSize() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        let (out, note) = try await Self.process(v, VideoProcessOptions(upscale: 2))
+        let info = try await VideoFrames.info(of: out)
+        #expect(info.width == 256 && info.height == 192)
+        #expect(note.contains("coreImageLanczos") && note.contains("256x192"))
+    }
+
+    @Test func retimingChangesSpeed() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        let (out, _) = try await Self.process(v, VideoProcessOptions(frameRate: 8))
+        let info = try await VideoFrames.info(of: out)
+        #expect(abs(info.duration - 12.0 / 8.0) < 0.2)
+    }
+
+    @Test func audioIsKeptUnlessSpeedChanges() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir, audio: true)
+        #expect(try await VideoFrames.info(of: v).hasAudio)
+        let (kept, _) = try await Self.process(v, VideoProcessOptions(interpolate: 2))
+        #expect(try await VideoFrames.info(of: kept).hasAudio)
+        let (dropped, note) = try await Self.process(v, VideoProcessOptions(frameRate: 8))
+        #expect(!(try await VideoFrames.info(of: dropped).hasAudio))
+        #expect(note.contains("audio dropped"))
+    }
+
+    @Test func framesFolderRoundTrip() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        let all = try await VideoFrames.read(v, selection: .all)
+        let folder = dir.appendingPathComponent("frames", isDirectory: true)
+        try await VideoFrameCollection(
+            cgImages: all.frames.map(\.image), metadata: VideoFrameMetadata(custom: ["frameRate": "16"])
+        ).save(to: folder, format: .png)
+        let (out, _) = try await Self.process(folder, VideoProcessOptions())
+        let info = try await VideoFrames.info(of: out)
+        #expect(abs(info.duration - 12.0 / 16.0) < 0.15 && info.width == 128)
+        // A folder with no recorded rate needs frame_rate.
+        let bare = dir.appendingPathComponent("bare", isDirectory: true)
+        try await VideoFrameCollection(cgImages: all.frames.map(\.image)).save(to: bare, format: .png)
+        await #expect(throws: VideoProcessError.self) { _ = try await Self.process(bare, VideoProcessOptions()) }
+        _ = try await Self.process(bare, VideoProcessOptions(frameRate: 12))
+    }
+
+    @Test func rejectsBadRequests() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let v = try await Self.makeVideo(in: dir)
+        await #expect(throws: VideoProcessError.self) { _ = try await Self.process(v, VideoProcessOptions()) }  // nothing to do
+        await #expect(throws: VideoProcessError.self) { _ = try await Self.process(v, VideoProcessOptions(upscale: 5)) }
+        await #expect(throws: VideoProcessError.self) { _ = try await Self.process(v, VideoProcessOptions(interpolate: 1)) }
+        await #expect(throws: VideoProcessError.self) { _ = try await Self.process(v, VideoProcessOptions(upscale: 4), limit: 1) }
+    }
+
+    @Test func memoryEstimateGrowsWithFactors() {
+        let base = VideoProcessing.estimateMemoryMB(frames: 100, width: 1024, height: 576, upscale: 1, interpolate: 1)
+        let up = VideoProcessing.estimateMemoryMB(frames: 100, width: 1024, height: 576, upscale: 2, interpolate: 1)
+        let both = VideoProcessing.estimateMemoryMB(frames: 100, width: 1024, height: 576, upscale: 2, interpolate: 2)
+        #expect(base < up && up < both)
+        #expect(base == 225)  // 100 frames x 1024 x 576 x 4 bytes
+    }
+
+    @Test func frameSelectionParsing() throws {
+        #expect(try MCPToolbox.parseSelection(.string("last")) == .last)
+        #expect(try MCPToolbox.parseSelection(.string("ALL")) == .all)
+        #expect(try MCPToolbox.parseSelection(.int(4)) == .indices([4]))
+        #expect(try MCPToolbox.parseSelection(.array([.int(1), .int(2)])) == .indices([1, 2]))
+        #expect(throws: (any Error).self) { _ = try MCPToolbox.parseSelection(.string("middle")) }
+        #expect(throws: (any Error).self) { _ = try MCPToolbox.parseSelection(nil) }
+    }
+
+    @Test func generateVideoOptionalOutputs() async throws {
+        let dir = try Self.tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = (0..<8).map { i in
+            ImageInputTests.image(128, 96, left: (UInt8(i * 30), 0, 0, 255), right: (0, 0, 0, 255))
+        }
+        let plain = try await VideoOutput.write(frames: frames, frameRate: 16, audio: nil, jobID: "job_a", into: dir)
+        #expect(plain.lastFrame == nil && plain.framesFolder == nil)
+        let full = try await VideoOutput.write(
+            frames: frames, frameRate: 16, audio: nil, jobID: "job_b", into: dir, saveLastFrame: true, saveFrames: true)
+        #expect(full.lastFrame.map { FileManager.default.fileExists(atPath: $0) } == true)
+        #expect(full.lastFrame?.hasSuffix("_last.png") == true)
+        let folder = try #require(full.framesFolder)
+        #expect(VideoFrameCollection.exists(at: URL(fileURLWithPath: folder)))
+        let info = try await VideoFrameCollection.info(from: URL(fileURLWithPath: folder))
+        #expect(info.frameCount == 8 && info.metadata.custom["frameRate"] == "16")
+    }
+
+    @Test func oldGuardrailSettingsStillDecode() throws {
+        let old = #"{"maxPixels":4194304,"maxSteps":80,"maxBatchCount":8,"maxFrames":129}"#
+        let g = try JSONDecoder().decode(Guardrails.self, from: Data(old.utf8))
+        #expect(g.maxFrames == 129 && g.maxProcessingMemoryMB == 6144)
     }
 }
